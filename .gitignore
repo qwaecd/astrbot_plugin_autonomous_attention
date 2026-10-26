@@ -82,6 +82,9 @@ target/
 profile_default/
 ipython_config.py
 
+vibe/
+.idea/
+
 # pyenv
 #   For a library or package, you might want to ignore these files since the code is
 #   intended to run in multiple environments; otherwise, check them in:
@@ -190,6 +193,12 @@ cython_debug/
 
 # Ruff stuff:
 .ruff_cache/
+
+# Local test and sandbox artifacts
+.pytest-tmp/
+tests/.tmp/
+tests/.astrbot-root/
+.acl-reports/
 
 # PyPI configuration file
 .pypirc
