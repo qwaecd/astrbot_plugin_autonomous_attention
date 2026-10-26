@@ -186,15 +186,6 @@ tests/                  不依赖 AstrBot 的核心测试
 
 核心包不导入 AstrBot；平台相关代码全部集中在 `astrbot_adapter.py` 和 `main.py`。
 
-## 测试
-
-```bash
-cd AstrBot/data/plugins/astrbot_plugin_autonomous_attention
-../../../.venv/Scripts/python -m pytest -q tests -o asyncio_mode=auto -p no:tmpdir
-```
-
-测试使用本地的 `tests/.tmp`，不依赖系统临时目录。
-
 ## 已知边界
 
 - 主动检查依赖群消息窗口。插件会观察 `group_allowlist` 内群聊的消息，并把窗口随状态一起持久化；若 AstrBot 自身的群聊历史功能关闭，重启前的部分未持久化消息可能缺失。
