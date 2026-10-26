@@ -113,7 +113,7 @@ class AttentionScheduler:
                     if claimed is not None:
                         await self._run_one(str(claimed.get("checkpoint_id") or ""))
                         continue
-                    delay = self.engine.seconds_until_next_due()
+                    delay = await self.engine.seconds_until_next_due()
                     delay = max(5, min(self.poll_seconds, int(delay)))
             except asyncio.CancelledError:
                 raise

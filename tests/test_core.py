@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -248,6 +249,21 @@ def test_state_migration_adds_source_and_priority() -> None:
     assert state["checkpoints"]["cp1"]["priority"] == 100
     assert state["decisions"][0]["source"] == "passive_agent"
     assert state["directives"] == {}
+
+
+@pytest.mark.asyncio
+async def test_scheduler_loop_awaits_due_hint(tmp_path: Path, caplog) -> None:
+    caplog.set_level(logging.ERROR, logger="attention-tests")
+    engine, _, _ = await make_engine(tmp_path)
+    try:
+        await asyncio.sleep(0.1)
+        hint = await engine.seconds_until_next_due()
+    finally:
+        await engine.stop()
+    assert isinstance(hint, int)
+    assert not any(
+        "scheduler loop iteration failed" in record.message for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio

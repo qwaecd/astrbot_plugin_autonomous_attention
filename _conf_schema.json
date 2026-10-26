@@ -10,7 +10,7 @@
     "type": "string",
     "default": "block_only",
     "options": ["off", "block_only", "full"],
-    "labels": ["完全关闭", "仅硬性策略", "完整被动注意力"],
+    "labels": ["off", "block_only", "full"],
     "hint": "off：关闭被动判断（硬性忽略策略仍生效）；block_only：不调用兴趣模型，只执行用户忽略/群聊限制/权限等硬性策略；full：调用兴趣模型决定是否放行主模型。"
   },
   "active_enabled": {
