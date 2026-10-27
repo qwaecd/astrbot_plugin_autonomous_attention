@@ -1,16 +1,18 @@
 """Autonomous Attention plugin entry point and AstrBot adapter wiring."""
 
+# ruff: noqa: I001
+
 from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import re
 import time
 from datetime import datetime
 from typing import Any
 
 from astrbot.api import AstrBotConfig
+from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At
 from astrbot.api.provider import ProviderRequest
@@ -81,9 +83,8 @@ class AutonomousAttentionPlugin(Star):
         self._apply_log_level()
 
     def _apply_log_level(self) -> None:
-        level = getattr(logging, self.settings.log_level, logging.INFO)
         try:
-            self.logger.setLevel(level)
+            logger.setLevel(self.settings.log_level)
         except Exception:
             pass
 
@@ -94,42 +95,38 @@ class AutonomousAttentionPlugin(Star):
             data_dir = StarTools.get_data_dir(PLUGIN_NAME)
             self.store = StateStore(
                 data_dir / "attention_state.json",
-                self.logger,
                 max_decisions=self.settings.max_decision_log,
             )
             self.gateway = AstrBotModelGateway(
                 self.context,
                 self.settings,
-                self.logger,
             )
             self.context_provider = AstrBotContextProvider(
                 self.context,
                 self.settings,
-                self.logger,
             )
             self.engine = AttentionEngine(
                 settings=self.settings,
                 store=self.store,
                 gateway=self.gateway,
                 context_provider=self.context_provider,
-                sender=AstrBotMessageSender(self.context, self.logger),
-                logger=self.logger,
+                sender=AstrBotMessageSender(self.context),
             )
             await self.engine.start()
             self._ready = True
-            self.logger.info(
+            logger.info(
                 "Autonomous Attention initialized (passive=%s, active=%s).",
                 self.settings.passive_mode,
                 self.settings.active_enabled,
             )
         except Exception:
             self._ready = False
-            self.logger.exception("Autonomous Attention failed to initialize.")
+            logger.exception("Autonomous Attention failed to initialize.")
             if self.engine is not None:
                 try:
                     await self.engine.stop()
                 except Exception:
-                    self.logger.exception("Attention cleanup after failure failed.")
+                    logger.exception("Attention cleanup after failure failed.")
 
     async def terminate(self) -> None:
         """Stop every background task and flush state."""
@@ -139,8 +136,8 @@ class AutonomousAttentionPlugin(Star):
             try:
                 await self.engine.stop()
             except Exception:
-                self.logger.exception("Autonomous Attention shutdown failed.")
-        self.logger.info("Autonomous Attention terminated.")
+                logger.exception("Autonomous Attention shutdown failed.")
+        logger.info("Autonomous Attention terminated.")
 
     def _reload_settings(self) -> None:
         self.settings = Settings.from_mapping(
@@ -199,7 +196,7 @@ class AutonomousAttentionPlugin(Star):
         if policy is not None:
             if event.is_at_or_wake_command:
                 event.stop_event()
-                self.logger.info(
+                logger.info(
                     "Hard ignore policy blocked woken message: umo=%s user=%s "
                     "scope=%s reason=%s",
                     event.unified_msg_origin,
@@ -266,12 +263,12 @@ class AutonomousAttentionPlugin(Star):
         except asyncio.CancelledError:
             raise
         except Exception:
-            self.logger.exception("Passive attention gate failed; passing through.")
+            logger.exception("Passive attention gate failed; passing through.")
             return
         if outcome.block:
             event.stop_event()
             event.set_extra("_aa_blocked", True)
-            self.logger.info(
+            logger.info(
                 "Passive attention blocked main model: umo=%s user=%s "
                 "decision=%s reason=%s",
                 event.unified_msg_origin,
@@ -833,7 +830,7 @@ class AutonomousAttentionPlugin(Star):
         try:
             self._set_config_value("general", "dry_run", enabled)
         except Exception:
-            self.logger.exception("Failed to persist dry_run setting.")
+            logger.exception("Failed to persist dry_run setting.")
         self._reload_settings()
         yield event.plain_result(
             f"dry-run 已{'开启' if enabled else '关闭'}。"

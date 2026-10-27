@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from astrbot.api import logger
 
 from .models import (
     SOURCE_ADMIN,
@@ -141,11 +142,9 @@ class StateStore:
     def __init__(
         self,
         path: Path,
-        logger: logging.Logger,
         max_decisions: int = 200,
     ) -> None:
         self.path = Path(path)
-        self.logger = logger
         self.max_decisions = max(10, int(max_decisions))
         self.lock = asyncio.Lock()
         self.state: dict[str, Any] = empty_state()
@@ -165,14 +164,14 @@ class StateStore:
             )
             try:
                 shutil.copy2(self.path, backup)
-                self.logger.error(
+                logger.error(
                     "Attention state was unreadable (%s); backed it up to %s and "
                     "started from an empty state.",
                     exc,
                     backup,
                 )
             except OSError:
-                self.logger.exception(
+                logger.exception(
                     "Attention state was unreadable and could not be backed up.",
                 )
             self.state = empty_state()

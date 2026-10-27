@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -37,11 +36,9 @@ class ActiveAttentionRunner:
         self,
         settings: Settings,
         gateway: ModelGateway,
-        logger: logging.Logger,
     ) -> None:
         self.settings = settings
         self.gateway = gateway
-        self.logger = logger
 
     def update_settings(self, settings: Settings) -> None:
         self.settings = settings

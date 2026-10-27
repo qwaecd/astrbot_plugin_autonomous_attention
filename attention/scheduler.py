@@ -7,8 +7,9 @@ whether to speak; that belongs to the active attention runner and hard policy.
 from __future__ import annotations
 
 import asyncio
-import logging
 from typing import TYPE_CHECKING, Any
+
+from astrbot.api import logger
 
 if TYPE_CHECKING:
     from .engine import AttentionEngine
@@ -20,11 +21,9 @@ class AttentionScheduler:
     def __init__(
         self,
         engine: AttentionEngine,
-        logger: logging.Logger,
         poll_seconds: int = 20,
     ) -> None:
         self.engine = engine
-        self.logger = logger
         self.poll_seconds = max(5, int(poll_seconds))
         self._stop_event = asyncio.Event()
         self._loop_task: asyncio.Task | None = None
@@ -41,7 +40,7 @@ class AttentionScheduler:
             self._loop(),
             name="autonomous-attention-scheduler",
         )
-        self.logger.info("Attention checkpoint scheduler started.")
+        logger.info("Attention checkpoint scheduler started.")
 
     async def stop(self) -> None:
         """Stop the loop and cancel every task started by this scheduler."""
@@ -58,7 +57,7 @@ class AttentionScheduler:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._run_tasks.clear()
-        self.logger.info("Attention checkpoint scheduler stopped.")
+        logger.info("Attention checkpoint scheduler stopped.")
 
     async def enqueue_checkpoint(self, checkpoint_id: str) -> bool:
         """Run a claimed checkpoint as a tracked background task.
@@ -94,7 +93,7 @@ class AttentionScheduler:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self.logger.exception(
+                logger.exception(
                     "Active attention checkpoint %s failed.",
                     checkpoint_id,
                 )
@@ -118,7 +117,7 @@ class AttentionScheduler:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self.logger.exception("Attention scheduler loop iteration failed.")
+                logger.exception("Attention scheduler loop iteration failed.")
                 delay = 30
 
             try:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -32,11 +31,9 @@ class PassiveAttentionRunner:
         self,
         settings: Settings,
         gateway: ModelGateway,
-        logger: logging.Logger,
     ) -> None:
         self.settings = settings
         self.gateway = gateway
-        self.logger = logger
 
     def update_settings(self, settings: Settings) -> None:
         self.settings = settings

@@ -8,7 +8,6 @@ and flushing it.
 from __future__ import annotations
 
 import hashlib
-import logging
 from datetime import datetime
 from typing import Any
 
@@ -30,9 +29,8 @@ from .timeutil import (
 class PolicyManager:
     """Evaluate hard policies and account for model/send budgets."""
 
-    def __init__(self, settings: Settings, logger: logging.Logger) -> None:
+    def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.logger = logger
 
     def update_settings(self, settings: Settings) -> None:
         self.settings = settings

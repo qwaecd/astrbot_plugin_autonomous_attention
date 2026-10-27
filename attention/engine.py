@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import logging
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timedelta
 from typing import Any
+
+from astrbot.api import logger
 
 from .active import ActiveAttentionRunner
 from .control import Actor, AttentionControlService, ControlResult
@@ -57,24 +58,21 @@ class AttentionEngine:
         gateway: ModelGateway,
         context_provider: ContextProvider,
         sender: MessageSender,
-        logger: logging.Logger,
     ) -> None:
         self.settings = settings
         self.store = store
         self.gateway = gateway
         self.context_provider = context_provider
         self.sender = sender
-        self.logger = logger
-        self.policy = PolicyManager(settings, logger)
+        self.policy = PolicyManager(settings)
         self.control = AttentionControlService(
             store,
             settings,
             self.policy,
-            logger,
         )
-        self.passive_runner = PassiveAttentionRunner(settings, gateway, logger)
-        self.active_runner = ActiveAttentionRunner(settings, gateway, logger)
-        self.scheduler = AttentionScheduler(self, logger)
+        self.passive_runner = PassiveAttentionRunner(settings, gateway)
+        self.active_runner = ActiveAttentionRunner(settings, gateway)
+        self.scheduler = AttentionScheduler(self)
         self._passive_semaphore = asyncio.Semaphore(settings.max_concurrent_decisions)
         self._passive_inflight: set[str] = set()
         self._passive_done: OrderedDict[str, PassiveOutcome] = OrderedDict()
@@ -95,7 +93,7 @@ class AttentionEngine:
             self._flush_locked()
         self._started = True
         await self.scheduler.start()
-        self.logger.info(
+        logger.info(
             "Autonomous attention core started: passive=%s active=%s dry_run=%s.",
             self.settings.passive_mode,
             self.settings.active_enabled,
@@ -111,7 +109,7 @@ class AttentionEngine:
         await self.scheduler.stop()
         async with self.store.lock:
             self._flush_locked()
-        self.logger.info("Autonomous attention core stopped.")
+        logger.info("Autonomous attention core stopped.")
 
     def update_settings(self, settings: Settings) -> None:
         """Apply a new configuration snapshot without restarting the plugin."""
@@ -127,7 +125,7 @@ class AttentionEngine:
         try:
             self.store.flush()
         except Exception:
-            self.logger.exception("Failed to persist attention state.")
+            logger.exception("Failed to persist attention state.")
 
     def _recover_running_locked(self) -> None:
         moment = self.policy.now()
@@ -143,7 +141,7 @@ class AttentionEngine:
             raw["scheduled_at"] = to_iso(
                 moment + timedelta(minutes=self.settings.min_interval_minutes)
             )
-            self.logger.warning(
+            logger.warning(
                 "Recovered interrupted checkpoint %s; it will retry after the "
                 "minimum interval.",
                 raw.get("checkpoint_id"),
@@ -198,13 +196,13 @@ class AttentionEngine:
                     ),
                 )
                 seeded.append(signature)
-                self.logger.info(
+                logger.info(
                     "Seeded attention checkpoint for %s (%s).",
                     group_id,
                     reason,
                 )
             except Exception as exc:
-                self.logger.warning(
+                logger.warning(
                     "Ignoring invalid seed checkpoint %s: %s",
                     item,
                     exc,
@@ -446,7 +444,7 @@ class AttentionEngine:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self.logger.exception("Passive attention runner failed.")
+            logger.exception("Passive attention runner failed.")
             run = PassiveRunResult(kind="error", error=str(exc))
 
         if run.kind == "ok" and run.decision is not None:
@@ -466,7 +464,7 @@ class AttentionEngine:
                 reason="decision model unavailable; passed through",
             )
             model_error = run.error
-            self.logger.warning(
+            logger.warning(
                 "Passive decision model failed for %s: %s. Passing through to "
                 "AstrBot's main model.",
                 request.umo,
@@ -553,7 +551,7 @@ class AttentionEngine:
             )
             self._flush_locked()
 
-        self.logger.info(
+        logger.info(
             "Passive attention: umo=%s user=%s decision=%s interest=%s reason=%s",
             request.umo,
             request.user_id or "-",
@@ -626,7 +624,7 @@ class AttentionEngine:
                         ),
                     )
                 except Exception as exc:
-                    self.logger.warning(
+                    logger.warning(
                         "retry_later checkpoint creation failed: %s",
                         exc,
                     )
@@ -1118,7 +1116,7 @@ class AttentionEngine:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self.logger.exception(
+            logger.exception(
                 "Active attention checkpoint %s crashed.",
                 checkpoint_id,
             )
@@ -1337,7 +1335,7 @@ class AttentionEngine:
                 },
             )
             self._flush_locked()
-        self.logger.info(
+        logger.info(
             "Active attention: checkpoint=%s group=%s decision=%s interest=%s reason=%s",
             checkpoint.get("checkpoint_id"),
             checkpoint.get("group_id"),
@@ -1574,7 +1572,7 @@ class AttentionEngine:
                     },
                 )
                 self._flush_locked()
-            self.logger.info(
+            logger.info(
                 "Dry-run active reply for %s suppressed (%s chars).",
                 umo,
                 len(message),
@@ -1715,7 +1713,7 @@ class AttentionEngine:
                 created_ts=timestamp(now),
                 is_bot=True,
             )
-        self.logger.info(
+        logger.info(
             "Active reply: checkpoint=%s group=%s sent=%s chars=%s",
             checkpoint_id,
             group_id,
@@ -1765,7 +1763,7 @@ class AttentionEngine:
                         ),
                     )
                 except Exception as exc:
-                    self.logger.warning("Agent checkpoint creation rejected: %s", exc)
+                    logger.warning("Agent checkpoint creation rejected: %s", exc)
                     continue
                 if checkpoint is not None:
                     changes.append(f"checkpoint:{checkpoint['checkpoint_id']}")
@@ -1804,7 +1802,7 @@ class AttentionEngine:
                 if policy_result.ok:
                     changes.append(f"policy:{policy_result.data.get('policy_id', '')}")
                 else:
-                    self.logger.info(
+                    logger.info(
                         "Active user-policy update rejected: %s",
                         policy_result.message,
                     )
@@ -1876,7 +1874,7 @@ class AttentionEngine:
                 },
             )
             self._flush_locked()
-        self.logger.info(
+        logger.info(
             "Active attention skipped: checkpoint=%s decision=%s reason=%s",
             checkpoint.get("checkpoint_id"),
             decision,

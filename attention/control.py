@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+
+from astrbot.api import logger
 
 from .models import (
     DIRECTIVE_TYPES,
@@ -97,12 +98,10 @@ class AttentionControlService:
         store: StateStore,
         settings: Settings,
         policy: PolicyManager,
-        logger: logging.Logger,
     ) -> None:
         self.store = store
         self.settings = settings
         self.policy = policy
-        self.logger = logger
 
     def update_settings(self, settings: Settings) -> None:
         self.settings = settings
@@ -1755,7 +1754,7 @@ class AttentionControlService:
         try:
             self.store.flush()
         except Exception:
-            self.logger.exception("Failed to persist attention control state.")
+            logger.exception("Failed to persist attention control state.")
 
     def _record_control_decision_locked(
         self,

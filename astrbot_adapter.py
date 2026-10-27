@@ -7,10 +7,10 @@ interfaces instead of ``AstrMessageEvent``, message chains, or provider objects.
 from __future__ import annotations
 
 import asyncio
-import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from astrbot.api import logger
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.provider.entities import ProviderRequest
@@ -28,11 +28,9 @@ class AstrBotModelGateway:
         self,
         context: Any,
         settings: Settings,
-        logger: logging.Logger,
     ) -> None:
         self.context = context
         self.settings = settings
-        self.logger = logger
 
     def update_settings(self, settings: Settings) -> None:
         self.settings = settings
@@ -109,7 +107,7 @@ class AstrBotModelGateway:
             except Exception:
                 usage = {}
         text = str(getattr(response, "completion_text", "") or "")
-        self.logger.debug(
+        logger.debug(
             "Attention model call: purpose=%s provider=%s chars=%s",
             purpose,
             provider_id,
@@ -129,11 +127,9 @@ class AstrBotContextProvider:
         self,
         context: Any,
         settings: Settings,
-        logger: logging.Logger,
     ) -> None:
         self.context = context
         self.settings = settings
-        self.logger = logger
 
     def update_settings(self, settings: Settings) -> None:
         self.settings = settings
@@ -166,7 +162,7 @@ class AstrBotContextProvider:
                 page_size=max(limit * 2, 20),
             )
         except Exception:
-            self.logger.debug(
+            logger.debug(
                 "Reading AstrBot group history failed for %s.",
                 umo,
                 exc_info=True,
@@ -233,7 +229,7 @@ class AstrBotContextProvider:
         try:
             persona = await manager.get_default_persona_v3(umo)
         except Exception:
-            self.logger.debug("Persona lookup failed for %s.", umo, exc_info=True)
+            logger.debug("Persona lookup failed for %s.", umo, exc_info=True)
             return ""
         if isinstance(persona, dict):
             return str(persona.get("prompt") or "")
@@ -246,10 +242,8 @@ class AstrBotMessageSender:
     def __init__(
         self,
         context: Any,
-        logger: logging.Logger,
     ) -> None:
         self.context = context
-        self.logger = logger
 
     async def send_text(self, umo: str, text: str) -> tuple[bool, str]:
         try:
@@ -258,7 +252,7 @@ class AstrBotMessageSender:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self.logger.exception("Sending proactive message to %s failed.", umo)
+            logger.exception("Sending proactive message to %s failed.", umo)
             return False, safe_error(f"{type(exc).__name__}: ", exc)
         if not sent:
             return False, "platform not found for session"

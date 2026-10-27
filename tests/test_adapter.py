@@ -86,7 +86,7 @@ class FakePersona:
 async def test_model_gateway_uses_llm_generate() -> None:
     context = FakeContext()
     settings = Settings.from_mapping({})
-    gateway = AstrBotModelGateway(context, settings, logger=_logger())
+    gateway = AstrBotModelGateway(context, settings)
     result = await gateway.generate(
         purpose="decision",
         umo="p:GroupMessage:g",
@@ -104,7 +104,7 @@ async def test_model_gateway_uses_llm_generate() -> None:
 async def test_context_provider_reads_history_and_persona() -> None:
     context = FakeContext()
     settings = Settings.from_mapping({"timezone": "Asia/Shanghai"})
-    provider = AstrBotContextProvider(context, settings, logger=_logger())
+    provider = AstrBotContextProvider(context, settings)
     window = await provider.window(
         umo="p:GroupMessage:g",
         platform_id="p",
@@ -120,7 +120,7 @@ async def test_context_provider_reads_history_and_persona() -> None:
 @pytest.mark.asyncio
 async def test_message_sender_calls_context() -> None:
     context = FakeContext()
-    sender = AstrBotMessageSender(context, logger=_logger())
+    sender = AstrBotMessageSender(context)
     sent, error = await sender.send_text("p:GroupMessage:g", "hello")
     assert sent is True
     assert error == ""
@@ -153,12 +153,6 @@ def test_build_passive_request_from_event() -> None:
     assert passive.group_id == "g"
     assert passive.contexts[0]["content"] == "hi"
     assert passive.timestamp.startswith("2026-01-01")
-
-
-def _logger():
-    import logging
-
-    return logging.getLogger("adapter-tests")
 
 
 def test_recent_message_roundtrip() -> None:

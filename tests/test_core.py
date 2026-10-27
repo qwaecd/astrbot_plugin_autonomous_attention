@@ -1,12 +1,12 @@
-"""Core tests that do not import AstrBot."""
+"""Core tests using the AstrBot logger facade but no platform objects."""
 
 from __future__ import annotations
 
 import asyncio
 import json
-import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -29,9 +29,6 @@ from attention.validation import (
     sanitize_reply,
     validate_passive_decision,
 )
-
-LOGGER = logging.getLogger("attention-tests")
-LOGGER.addHandler(logging.NullHandler())
 
 
 def make_settings(**overrides: Any) -> Settings:
@@ -132,14 +129,13 @@ async def make_engine(
     gateway = gateway or FakeGateway()
     context_provider = context_provider or FakeContextProvider()
     sender = sender or FakeSender()
-    store = StateStore(tmp_path / "state.json", LOGGER, 50)
+    store = StateStore(tmp_path / "state.json", max_decisions=50)
     engine = AttentionEngine(
         settings=settings,
         store=store,
         gateway=gateway,
         context_provider=context_provider,
         sender=sender,
-        logger=LOGGER,
     )
     await engine.start()
     return engine, store, gateway
@@ -246,16 +242,16 @@ def test_settings_reads_grouped_config() -> None:
 @pytest.mark.asyncio
 async def test_store_roundtrip_and_recovery(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
-    store = StateStore(path, LOGGER, 50)
+    store = StateStore(path, max_decisions=50)
     async with store.lock:
         store.state["policies"]["x"] = {"scope": "user", "user_id": "u"}
         store.flush()
-    loaded = StateStore(path, LOGGER, 50)
+    loaded = StateStore(path, max_decisions=50)
     await loaded.load()
     assert loaded.state["policies"]["x"]["user_id"] == "u"
 
     path.write_text("{broken", encoding="utf-8")
-    corrupt = StateStore(path, LOGGER, 50)
+    corrupt = StateStore(path, max_decisions=50)
     await corrupt.load()
     assert corrupt.state["policies"] == {}
     assert list(tmp_path.glob("state.corrupt-*.json"))
@@ -292,8 +288,24 @@ def test_state_migration_adds_source_and_priority() -> None:
 
 
 @pytest.mark.asyncio
-async def test_scheduler_loop_awaits_due_hint(tmp_path: Path, caplog) -> None:
-    caplog.set_level(logging.ERROR, logger="attention-tests")
+async def test_scheduler_loop_awaits_due_hint(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import attention.scheduler as scheduler_module
+
+    errors: list[tuple] = []
+    monkeypatch.setattr(
+        scheduler_module,
+        "logger",
+        SimpleNamespace(
+            info=lambda *args, **kwargs: None,
+            debug=lambda *args, **kwargs: None,
+            warning=lambda *args, **kwargs: None,
+            error=lambda *args, **kwargs: errors.append(args),
+            exception=lambda *args, **kwargs: errors.append(args),
+        ),
+    )
     engine, _, _ = await make_engine(tmp_path)
     try:
         await asyncio.sleep(0.1)
@@ -301,9 +313,7 @@ async def test_scheduler_loop_awaits_due_hint(tmp_path: Path, caplog) -> None:
     finally:
         await engine.stop()
     assert isinstance(hint, int)
-    assert not any(
-        "scheduler loop iteration failed" in record.message for record in caplog.records
-    )
+    assert errors == []
 
 
 @pytest.mark.asyncio
@@ -775,7 +785,7 @@ async def test_active_main_model_failure_does_not_send(tmp_path: Path) -> None:
 
 def test_policy_quiet_hours_and_group_matching() -> None:
     settings = make_settings(quiet_hours="12:00-13:00", group_allowlist=["g1"])
-    policy = PolicyManager(settings, LOGGER)
+    policy = PolicyManager(settings)
     tz = settings.tz
     assert policy.is_quiet(datetime(2026, 1, 1, 12, 30, tzinfo=tz))
     assert not policy.is_quiet(datetime(2026, 1, 1, 14, 30, tzinfo=tz))
@@ -794,7 +804,7 @@ def test_policy_quiet_hours_and_group_matching() -> None:
 def test_group_allowlist_is_the_single_boundary() -> None:
     moment = datetime(2026, 1, 1, 14, 30, tzinfo=make_settings().tz)
     empty = make_settings(group_allowlist=[])
-    empty_policy = PolicyManager(empty, LOGGER)
+    empty_policy = PolicyManager(empty)
     assert not empty_policy.group_allowed("g1", "p:GroupMessage:g1")
     state = {"budget": {}, "policies": {}, "send_stats": {}}
     allowed, reason = empty_policy.can_send(
@@ -808,7 +818,7 @@ def test_group_allowlist_is_the_single_boundary() -> None:
     assert reason == "group_not_allowed"
 
     explicit = make_settings(group_allowlist=["g1"])
-    explicit_policy = PolicyManager(explicit, LOGGER)
+    explicit_policy = PolicyManager(explicit)
     assert explicit_policy.group_allowed("g1", "p:GroupMessage:g1")
     assert not explicit_policy.group_allowed("g2", "p:GroupMessage:g2")
     assert explicit_policy.can_send(

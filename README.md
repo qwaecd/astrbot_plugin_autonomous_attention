@@ -189,10 +189,10 @@ attention/
   prompts.py            两套评判提示词与上下文格式化
   validation.py         JSON 提取与结构校验
   settings.py           配置快照与边界
-tests/                  不依赖 AstrBot 的核心测试
+tests/                  使用 AstrBot logger facade 的核心逻辑测试
 ```
 
-核心包不导入 AstrBot；平台相关代码全部集中在 `astrbot_adapter.py` 和 `main.py`。
+核心包只从 `astrbot.api` 导入官方 `logger` 以满足平台日志规范；其余平台能力仍通过适配层注入，不把 `AstrMessageEvent`、消息链或平台 API 传入核心。
 
 ## 已知边界
 
