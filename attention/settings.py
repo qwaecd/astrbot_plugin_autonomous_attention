@@ -68,6 +68,15 @@ def _dict_list(value: Any) -> tuple[dict[str, Any], ...]:
     return tuple(result)
 
 
+def _get(data: Mapping[str, Any], section: str, key: str) -> Any:
+    """Read a grouped config value, falling back to the legacy flat key."""
+
+    section_data = data.get(section)
+    if isinstance(section_data, Mapping) and key in section_data:
+        return section_data[key]
+    return data.get(key)
+
+
 @dataclass(frozen=True)
 class Settings:
     """A validated snapshot of plugin configuration."""
@@ -145,162 +154,180 @@ class Settings:
         """
 
         data = dict(config or {})
-        passive_mode = _text(data.get("passive_mode"), "block_only").lower()
+        passive_mode = _text(
+            _get(data, "general", "passive_mode"), "block_only"
+        ).lower()
         if passive_mode not in PASSIVE_MODES:
             passive_mode = "block_only"
-        log_level = _text(data.get("log_level"), "INFO").upper()
+        log_level = _text(_get(data, "general", "log_level"), "INFO").upper()
         if log_level not in LOG_LEVELS:
             log_level = "INFO"
-        persona_source = _text(data.get("persona_source"), "astrbot").lower()
+        persona_source = _text(
+            _get(data, "models", "persona_source"), "astrbot"
+        ).lower()
         if persona_source not in {"astrbot", "custom"}:
             persona_source = "astrbot"
-        timezone_name = _text(data.get("timezone")) or _text(fallback_timezone)
-        min_interval = _int(data.get("min_interval_minutes"), 10, 1, 10080)
+        timezone_name = _text(_get(data, "general", "timezone")) or _text(
+            fallback_timezone
+        )
+        min_interval = _int(
+            _get(data, "scheduling", "min_interval_minutes"), 10, 1, 10080
+        )
         max_interval = _int(
-            data.get("max_interval_minutes"),
+            _get(data, "scheduling", "max_interval_minutes"),
             1440,
             min_interval,
             43200,
         )
         default_interval = _int(
-            data.get("default_interval_minutes"),
+            _get(data, "scheduling", "default_interval_minutes"),
             60,
             min_interval,
             max_interval,
         )
         max_defer = _int(
-            data.get("max_defer_minutes"),
+            _get(data, "scheduling", "max_defer_minutes"),
             1440,
             min_interval,
             43200,
         )
         return cls(
-            enabled=_bool(data.get("enabled"), True),
+            enabled=_bool(_get(data, "general", "enabled"), True),
             passive_mode=passive_mode,
-            active_enabled=_bool(data.get("active_enabled"), True),
-            decision_provider_id=_text(data.get("decision_provider_id")),
-            main_provider_id=_text(data.get("main_provider_id")),
+            active_enabled=_bool(_get(data, "general", "active_enabled"), True),
+            decision_provider_id=_text(_get(data, "models", "decision_provider_id")),
+            main_provider_id=_text(_get(data, "models", "main_provider_id")),
             persona_source=persona_source,
-            custom_persona=_text(data.get("custom_persona")),
+            custom_persona=_text(_get(data, "models", "custom_persona")),
             passive_criteria=_text(
-                data.get("passive_criteria"),
+                _get(data, "models", "passive_criteria"),
                 DEFAULT_PASSIVE_CRITERIA,
             )
             or DEFAULT_PASSIVE_CRITERIA,
             active_criteria=_text(
-                data.get("active_criteria"),
+                _get(data, "models", "active_criteria"),
                 DEFAULT_ACTIVE_CRITERIA,
             )
             or DEFAULT_ACTIVE_CRITERIA,
-            group_allowlist=_str_list(data.get("group_allowlist")),
-            blocked_group_ids=_str_list(data.get("blocked_group_ids")),
+            group_allowlist=_str_list(_get(data, "groups", "group_allowlist")),
+            blocked_group_ids=_str_list(_get(data, "groups", "blocked_group_ids")),
             context_window_messages=_int(
-                data.get("context_window_messages"),
+                _get(data, "context", "context_window_messages"),
                 30,
                 5,
                 200,
             ),
-            context_max_chars=_int(data.get("context_max_chars"), 8000, 500, 60000),
-            quiet_hours=_text(data.get("quiet_hours")),
+            context_max_chars=_int(
+                _get(data, "context", "context_max_chars"), 8000, 500, 60000
+            ),
+            quiet_hours=_text(_get(data, "scheduling", "quiet_hours")),
             min_interval_minutes=min_interval,
             max_interval_minutes=max_interval,
             default_interval_minutes=default_interval,
             max_defer_minutes=max_defer,
             group_send_cooldown_minutes=_int(
-                data.get("group_send_cooldown_minutes"),
+                _get(data, "scheduling", "group_send_cooldown_minutes"),
                 30,
                 0,
                 10080,
             ),
             global_send_cooldown_minutes=_int(
-                data.get("global_send_cooldown_minutes"),
+                _get(data, "scheduling", "global_send_cooldown_minutes"),
                 10,
                 0,
                 10080,
             ),
             daily_model_call_budget=_int(
-                data.get("daily_model_call_budget"),
+                _get(data, "budgets", "daily_model_call_budget"),
                 200,
                 0,
                 100000,
             ),
             daily_active_message_budget=_int(
-                data.get("daily_active_message_budget"),
+                _get(data, "budgets", "daily_active_message_budget"),
                 10,
                 0,
                 1000,
             ),
             daily_active_check_budget=_int(
-                data.get("daily_active_check_budget"),
+                _get(data, "budgets", "daily_active_check_budget"),
                 50,
                 0,
                 10000,
             ),
-            max_agent_rounds=_int(data.get("max_agent_rounds"), 4, 1, 20),
-            max_tool_calls=_int(data.get("max_tool_calls"), 6, 0, 50),
+            max_agent_rounds=_int(
+                _get(data, "agent_limits", "max_agent_rounds"), 4, 1, 20
+            ),
+            max_tool_calls=_int(_get(data, "agent_limits", "max_tool_calls"), 6, 0, 50),
             max_checkpoint_mutations=_int(
-                data.get("max_checkpoint_mutations"),
+                _get(data, "agent_limits", "max_checkpoint_mutations"),
                 2,
                 0,
                 20,
             ),
             max_main_model_calls=_int(
-                data.get("max_main_model_calls"),
+                _get(data, "agent_limits", "max_main_model_calls"),
                 1,
                 0,
                 3,
             ),
             decision_timeout_seconds=_int(
-                data.get("decision_timeout_seconds"),
+                _get(data, "agent_limits", "decision_timeout_seconds"),
                 45,
                 5,
                 600,
             ),
-            max_reply_chars=_int(data.get("max_reply_chars"), 500, 20, 4000),
-            max_reason_chars=_int(data.get("max_reason_chars"), 200, 20, 2000),
-            dry_run=_bool(data.get("dry_run"), False),
+            max_reply_chars=_int(
+                _get(data, "agent_limits", "max_reply_chars"), 500, 20, 4000
+            ),
+            max_reason_chars=_int(
+                _get(data, "agent_limits", "max_reason_chars"), 200, 20, 2000
+            ),
+            dry_run=_bool(_get(data, "general", "dry_run"), False),
             log_level=log_level,
-            max_decision_log=_int(data.get("max_decision_log"), 200, 10, 5000),
+            max_decision_log=_int(
+                _get(data, "general", "max_decision_log"), 200, 10, 5000
+            ),
             passive_retry_delay_minutes=_int(
-                data.get("passive_retry_delay_minutes"),
+                _get(data, "scheduling", "passive_retry_delay_minutes"),
                 10,
                 min_interval,
                 max_interval,
             ),
-            owner_override=_bool(data.get("owner_override"), True),
+            owner_override=_bool(_get(data, "safety", "owner_override"), True),
             max_auto_policy_hours=_int(
-                data.get("max_auto_policy_hours"),
+                _get(data, "budgets", "max_auto_policy_hours"),
                 168,
                 1,
                 8760,
             ),
             main_agent_max_policy_hours=_int(
-                data.get("main_agent_max_policy_hours"),
+                _get(data, "budgets", "main_agent_max_policy_hours"),
                 24,
                 1,
                 8760,
             ),
             main_agent_max_intent_hours=_int(
-                data.get("main_agent_max_intent_hours"),
+                _get(data, "budgets", "main_agent_max_intent_hours"),
                 24,
                 1,
                 8760,
             ),
             main_agent_tools_enabled=_bool(
-                data.get("main_agent_tools_enabled"),
+                _get(data, "general", "main_agent_tools_enabled"),
                 True,
             ),
             timezone=timezone_name,
             tz=resolve_timezone(timezone_name),
-            seed_checkpoints=_dict_list(data.get("seed_checkpoints")),
+            seed_checkpoints=_dict_list(_get(data, "scheduling", "seed_checkpoints")),
             max_context_sessions=_int(
-                data.get("max_context_sessions"),
+                _get(data, "context", "max_context_sessions"),
                 50,
                 1,
                 1000,
             ),
             max_concurrent_decisions=_int(
-                data.get("max_concurrent_decisions"),
+                _get(data, "general", "max_concurrent_decisions"),
                 4,
                 1,
                 32,

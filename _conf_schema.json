@@ -1,306 +1,481 @@
 {
-  "enabled": {
-    "description": "总开关",
-    "type": "bool",
-    "default": true,
-    "hint": "关闭后不会进行任何注意力判断，也不会执行检查点。"
-  },
-  "passive_mode": {
-    "description": "被动注意力模式",
-    "type": "string",
-    "default": "block_only",
-    "options": ["off", "block_only", "full"],
-    "labels": ["off", "block_only", "full"],
-    "hint": "off：关闭被动判断（硬性忽略策略仍生效）；block_only：不调用兴趣模型，只执行用户忽略/群聊限制/权限等硬性策略；full：调用兴趣模型决定是否放行主模型。"
-  },
-  "active_enabled": {
-    "description": "启用主动检查",
-    "type": "bool",
-    "default": true,
-    "hint": "关闭后不会执行任何检查点，但检查点数据会保留。"
-  },
-  "decision_provider_id": {
-    "description": "兴趣决策模型",
-    "type": "string",
-    "default": "",
-    "_special": "select_provider",
-    "hint": "用于被动/主动兴趣判断的模型。留空时使用当前会话的主模型。"
-  },
-  "main_provider_id": {
-    "description": "主动回复主模型",
-    "type": "string",
-    "default": "",
-    "_special": "select_provider",
-    "hint": "主动参与时用于生成回复的模型。留空时使用当前会话的主模型。"
-  },
-  "persona_source": {
-    "description": "人格来源",
-    "type": "string",
-    "default": "astrbot",
-    "options": ["astrbot", "custom"],
-    "labels": ["AstrBot 人格", "自定义人格"],
-    "hint": "被动路径会复用主模型的 System Prompt；主动路径使用这里指定的人格。"
-  },
-  "custom_persona": {
-    "description": "自定义人格",
-    "type": "text",
-    "default": "",
-    "hint": "当人格来源为 custom 时使用。留空则使用内置默认人格。"
-  },
-  "passive_criteria": {
-    "description": "被动评判标准",
-    "type": "text",
-    "default": "",
-    "hint": "留空使用内置标准。用于判断一条唤醒消息是否值得交给主模型。"
-  },
-  "active_criteria": {
-    "description": "主动评判标准",
-    "type": "text",
-    "default": "",
-    "hint": "留空使用内置标准。用于判断检查点到达时是否参与群聊。"
-  },
-  "group_allowlist": {
-    "description": "允许关注和主动发言的群聊",
-    "type": "list",
-    "default": [],
-    "hint": "唯一群聊白名单：只有这里的群可以被观察、建立检查点、执行检查并接收主动消息。留空表示不启用任何群聊的注意力功能（私聊被动判断不受影响）。支持群号、platform_id:群号或完整 UMO。"
-  },
-  "blocked_group_ids": {
-    "description": "禁止参与的群聊",
-    "type": "list",
-    "default": [],
-    "hint": "这些群不会进入注意力判断，也不会执行检查点。格式同群聊白名单。"
-  },
-  "context_window_messages": {
-    "description": "滑动消息窗口大小",
-    "type": "int",
-    "default": 30,
-    "slider": {"min": 5, "max": 200, "step": 1},
-    "hint": "主动检查时最多读取的历史消息条数。"
-  },
-  "context_max_chars": {
-    "description": "上下文字符上限",
-    "type": "int",
-    "default": 8000,
-    "slider": {"min": 500, "max": 60000, "step": 500},
-    "hint": "传给兴趣模型的上下文最大字符数，超出时优先保留最新消息。"
-  },
-  "quiet_hours": {
-    "description": "静默时段",
-    "type": "string",
-    "default": "",
-    "hint": "例如 23:00-08:00。静默时段内不执行主动检查、不主动发言。留空表示不限制。"
-  },
-  "min_interval_minutes": {
-    "description": "最短检查间隔（分钟）",
-    "type": "int",
-    "default": 10,
-    "slider": {"min": 1, "max": 1440, "step": 1}
-  },
-  "max_interval_minutes": {
-    "description": "最长检查间隔（分钟）",
-    "type": "int",
-    "default": 1440,
-    "slider": {"min": 10, "max": 43200, "step": 10}
-  },
-  "default_interval_minutes": {
-    "description": "默认检查间隔（分钟）",
-    "type": "int",
-    "default": 60,
-    "slider": {"min": 1, "max": 1440, "step": 1},
-    "hint": "Agent 未指定下一次检查时间时使用。"
-  },
-  "max_defer_minutes": {
-    "description": "最长延后时间（分钟）",
-    "type": "int",
-    "default": 1440,
-    "slider": {"min": 10, "max": 43200, "step": 10}
-  },
-  "group_send_cooldown_minutes": {
-    "description": "单群主动发言冷却（分钟）",
-    "type": "int",
-    "default": 30,
-    "slider": {"min": 0, "max": 1440, "step": 1},
-    "hint": "0 表示不限制。"
-  },
-  "global_send_cooldown_minutes": {
-    "description": "全局主动发言冷却（分钟）",
-    "type": "int",
-    "default": 10,
-    "slider": {"min": 0, "max": 1440, "step": 1},
-    "hint": "0 表示不限制。"
-  },
-  "daily_model_call_budget": {
-    "description": "每日模型调用预算",
-    "type": "int",
-    "default": 200,
-    "slider": {"min": 0, "max": 10000, "step": 10},
-    "hint": "兴趣模型和主动回复主模型共享此预算。0 表示禁止所有兴趣/主动模型调用。"
-  },
-  "daily_active_message_budget": {
-    "description": "每日主动发言上限",
-    "type": "int",
-    "default": 10,
-    "slider": {"min": 0, "max": 200, "step": 1}
-  },
-  "daily_active_check_budget": {
-    "description": "每日主动检查上限",
-    "type": "int",
-    "default": 50,
-    "slider": {"min": 0, "max": 2000, "step": 1}
-  },
-  "max_agent_rounds": {
-    "description": "主动 Agent 最大轮数",
-    "type": "int",
-    "default": 4,
-    "slider": {"min": 1, "max": 20, "step": 1}
-  },
-  "max_tool_calls": {
-    "description": "主动 Agent 最大工具调用次数",
-    "type": "int",
-    "default": 6,
-    "slider": {"min": 0, "max": 50, "step": 1}
-  },
-  "max_checkpoint_mutations": {
-    "description": "单次检查最多修改检查点次数",
-    "type": "int",
-    "default": 2,
-    "slider": {"min": 0, "max": 20, "step": 1}
-  },
-  "max_main_model_calls": {
-    "description": "单次检查最多主模型调用次数",
-    "type": "int",
-    "default": 1,
-    "slider": {"min": 0, "max": 3, "step": 1}
-  },
-  "decision_timeout_seconds": {
-    "description": "兴趣模型超时（秒）",
-    "type": "int",
-    "default": 45,
-    "slider": {"min": 5, "max": 600, "step": 5}
-  },
-  "max_reply_chars": {
-    "description": "主动回复最大字符数",
-    "type": "int",
-    "default": 500,
-    "slider": {"min": 20, "max": 4000, "step": 10}
-  },
-  "max_reason_chars": {
-    "description": "决策理由最大字符数",
-    "type": "int",
-    "default": 200,
-    "slider": {"min": 20, "max": 2000, "step": 10}
-  },
-  "dry_run": {
-    "description": "dry-run 模式",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后仍会调用兴趣模型并记录决策，但不会拦截主模型，也不会真正发送主动消息。"
-  },
-  "log_level": {
-    "description": "日志详细程度",
-    "type": "string",
-    "default": "INFO",
-    "options": ["INFO", "DEBUG", "WARNING", "ERROR"],
-    "hint": "DEBUG 会输出更多模型与上下文诊断信息，但仍不会输出完整聊天内容。"
-  },
-  "max_decision_log": {
-    "description": "保留的决策记录条数",
-    "type": "int",
-    "default": 200,
-    "slider": {"min": 10, "max": 5000, "step": 10}
-  },
-  "passive_retry_delay_minutes": {
-    "description": "retry_later 延迟（分钟）",
-    "type": "int",
-    "default": 10,
-    "slider": {"min": 1, "max": 1440, "step": 1},
-    "hint": "被动决策选择 retry_later 时，为当前群创建检查点的延迟。"
-  },
-  "owner_override": {
-    "description": "主人覆盖忽略策略",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后管理员/主人不会被用户忽略策略拦截。"
-  },
-  "max_auto_policy_hours": {
-    "description": "注意力 Agent 临时忽略策略最长时间（小时）",
-    "type": "int",
-    "default": 168,
-    "slider": {"min": 1, "max": 8760, "step": 1}
-  },
-  "main_agent_max_policy_hours": {
-    "description": "主 Agent 工具创建忽略策略的默认/上限小时数",
-    "type": "int",
-    "default": 24,
-    "slider": {"min": 1, "max": 8760, "step": 1},
-    "hint": "普通成员通过主模型工具创建忽略策略时受此时限约束；管理员仍可用管理指令创建更长期或永久策略。"
-  },
-  "main_agent_max_intent_hours": {
-    "description": "主 Agent 意图默认/上限小时数",
-    "type": "int",
-    "default": 24,
-    "slider": {"min": 1, "max": 8760, "step": 1},
-    "hint": "关注、话题关注、停止关注和定时检查等主 Agent 意图的有效时间上限。"
-  },
-  "main_agent_tools_enabled": {
-    "description": "启用主模型注意力工具",
-    "type": "bool",
-    "default": true,
-    "hint": "关闭后主模型无法调用 attention_query、attention_set_intent、attention_ignore_user 等工具；后台注意力 Agent 不受影响。"
-  },
-  "timezone": {
-    "description": "时区",
-    "type": "string",
-    "default": "",
-    "hint": "IANA 时区名，例如 Asia/Shanghai。留空使用 AstrBot 全局时区。"
-  },
-  "seed_checkpoints": {
-    "description": "初始检查点",
-    "type": "list",
-    "default": [],
-    "hint": "可选。插件首次启动时会按此配置创建检查点；使用过的条目不会重复创建。",
+  "general": {
+    "description": "基础设置",
+    "type": "object",
+    "hint": "插件总开关、被动模式、主模型工具、dry-run、日志与时区。",
     "items": {
-      "type": "object",
-      "properties": {
-        "session": {
-          "description": "目标会话 UMO 或群号",
-          "type": "string",
-          "default": ""
-        },
-        "platform_id": {
-          "description": "平台实例 ID",
-          "type": "string",
-          "default": ""
-        },
-        "group_id": {
-          "description": "群号",
-          "type": "string",
-          "default": ""
-        },
-        "at": {
-          "description": "计划时间（ISO 8601）",
-          "type": "string",
-          "default": ""
-        },
-        "reason": {
-          "description": "检查原因",
-          "type": "string",
-          "default": ""
+      "enabled": {
+        "description": "总开关",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后不会进行任何注意力判断，也不会执行检查点。"
+      },
+      "passive_mode": {
+        "description": "被动注意力模式",
+        "type": "string",
+        "default": "block_only",
+        "options": [
+          "off",
+          "block_only",
+          "full"
+        ],
+        "labels": [
+          "完全关闭",
+          "仅硬性策略",
+          "完整被动注意力"
+        ],
+        "hint": "off：关闭被动判断（硬性忽略策略仍生效）；block_only：不调用兴趣模型，只执行用户忽略/群聊限制/权限等硬性策略；full：调用兴趣模型决定是否放行主模型。"
+      },
+      "active_enabled": {
+        "description": "启用主动检查",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后不会执行任何检查点，但检查点数据会保留。"
+      },
+      "main_agent_tools_enabled": {
+        "description": "启用主模型注意力工具",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后主模型无法调用 attention_query、attention_set_intent、attention_ignore_user 等工具；后台注意力 Agent 不受影响。"
+      },
+      "dry_run": {
+        "description": "dry-run 模式",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后仍会调用兴趣模型并记录决策，但不会拦截主模型，也不会真正发送主动消息。"
+      },
+      "log_level": {
+        "description": "日志详细程度",
+        "type": "string",
+        "default": "INFO",
+        "options": [
+          "INFO",
+          "DEBUG",
+          "WARNING",
+          "ERROR"
+        ],
+        "hint": "DEBUG 会输出更多模型与上下文诊断信息，但仍不会输出完整聊天内容。"
+      },
+      "timezone": {
+        "description": "时区",
+        "type": "string",
+        "default": "",
+        "hint": "IANA 时区名，例如 Asia/Shanghai。留空使用 AstrBot 全局时区。"
+      },
+      "max_decision_log": {
+        "description": "保留的决策记录条数",
+        "type": "int",
+        "default": 200,
+        "slider": {
+          "min": 10,
+          "max": 5000,
+          "step": 10
+        }
+      },
+      "max_concurrent_decisions": {
+        "description": "最大并发被动决策数",
+        "type": "int",
+        "default": 4,
+        "slider": {
+          "min": 1,
+          "max": 32,
+          "step": 1
         }
       }
     }
   },
-  "max_context_sessions": {
-    "description": "最多保留窗口的会话数",
-    "type": "int",
-    "default": 50,
-    "slider": {"min": 1, "max": 1000, "step": 1}
+  "models": {
+    "description": "模型与人格",
+    "type": "object",
+    "hint": "兴趣决策模型、主动回复主模型、人格来源和两套评判标准。",
+    "items": {
+      "decision_provider_id": {
+        "description": "兴趣决策模型",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "用于被动/主动兴趣判断的模型。留空时使用当前会话的主模型。"
+      },
+      "main_provider_id": {
+        "description": "主动回复主模型",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "主动参与时用于生成回复的模型。留空时使用当前会话的主模型。"
+      },
+      "persona_source": {
+        "description": "人格来源",
+        "type": "string",
+        "default": "astrbot",
+        "options": [
+          "astrbot",
+          "custom"
+        ],
+        "labels": [
+          "AstrBot 人格",
+          "自定义人格"
+        ],
+        "hint": "被动路径会复用主模型的 System Prompt；主动路径使用这里指定的人格。"
+      },
+      "custom_persona": {
+        "description": "自定义人格",
+        "type": "text",
+        "default": "",
+        "hint": "当人格来源为 custom 时使用。留空则使用内置默认人格。"
+      },
+      "passive_criteria": {
+        "description": "被动评判标准",
+        "type": "text",
+        "default": "",
+        "hint": "留空使用内置标准。用于判断一条唤醒消息是否值得交给主模型。"
+      },
+      "active_criteria": {
+        "description": "主动评判标准",
+        "type": "text",
+        "default": "",
+        "hint": "留空使用内置标准。用于判断检查点到达时是否参与群聊。"
+      }
+    }
   },
-  "max_concurrent_decisions": {
-    "description": "最大并发被动决策数",
-    "type": "int",
-    "default": 4,
-    "slider": {"min": 1, "max": 32, "step": 1}
+  "groups": {
+    "description": "群聊边界",
+    "type": "object",
+    "hint": "唯一群聊白名单与禁止群列表；白名单为空表示不启用任何群聊注意力功能。",
+    "items": {
+      "group_allowlist": {
+        "description": "允许关注和主动发言的群聊",
+        "type": "list",
+        "default": [],
+        "hint": "唯一群聊白名单：只有这里的群可以被观察、建立检查点、执行检查并接收主动消息。留空表示不启用任何群聊的注意力功能（私聊被动判断不受影响）。支持群号、platform_id:群号或完整 UMO。"
+      },
+      "blocked_group_ids": {
+        "description": "禁止参与的群聊",
+        "type": "list",
+        "default": [],
+        "hint": "这些群不会进入注意力判断，也不会执行检查点。格式同群聊白名单。"
+      }
+    }
+  },
+  "context": {
+    "description": "上下文窗口",
+    "type": "object",
+    "hint": "主动检查读取的历史消息数量、字符上限和会话窗口保留数。",
+    "items": {
+      "context_window_messages": {
+        "description": "滑动消息窗口大小",
+        "type": "int",
+        "default": 30,
+        "slider": {
+          "min": 5,
+          "max": 200,
+          "step": 1
+        },
+        "hint": "主动检查时最多读取的历史消息条数。"
+      },
+      "context_max_chars": {
+        "description": "上下文字符上限",
+        "type": "int",
+        "default": 8000,
+        "slider": {
+          "min": 500,
+          "max": 60000,
+          "step": 500
+        },
+        "hint": "传给兴趣模型的上下文最大字符数，超出时优先保留最新消息。"
+      },
+      "max_context_sessions": {
+        "description": "最多保留窗口的会话数",
+        "type": "int",
+        "default": 50,
+        "slider": {
+          "min": 1,
+          "max": 1000,
+          "step": 1
+        }
+      }
+    }
+  },
+  "scheduling": {
+    "description": "检查点与冷却",
+    "type": "object",
+    "hint": "静默时段、检查间隔、主动发言冷却、被动重试延迟和初始检查点。",
+    "items": {
+      "quiet_hours": {
+        "description": "静默时段",
+        "type": "string",
+        "default": "",
+        "hint": "例如 23:00-08:00。静默时段内不执行主动检查、不主动发言。留空表示不限制。"
+      },
+      "min_interval_minutes": {
+        "description": "最短检查间隔（分钟）",
+        "type": "int",
+        "default": 10,
+        "slider": {
+          "min": 1,
+          "max": 1440,
+          "step": 1
+        }
+      },
+      "max_interval_minutes": {
+        "description": "最长检查间隔（分钟）",
+        "type": "int",
+        "default": 1440,
+        "slider": {
+          "min": 10,
+          "max": 43200,
+          "step": 10
+        }
+      },
+      "default_interval_minutes": {
+        "description": "默认检查间隔（分钟）",
+        "type": "int",
+        "default": 60,
+        "slider": {
+          "min": 1,
+          "max": 1440,
+          "step": 1
+        },
+        "hint": "Agent 未指定下一次检查时间时使用。"
+      },
+      "max_defer_minutes": {
+        "description": "最长延后时间（分钟）",
+        "type": "int",
+        "default": 1440,
+        "slider": {
+          "min": 10,
+          "max": 43200,
+          "step": 10
+        }
+      },
+      "group_send_cooldown_minutes": {
+        "description": "单群主动发言冷却（分钟）",
+        "type": "int",
+        "default": 30,
+        "slider": {
+          "min": 0,
+          "max": 1440,
+          "step": 1
+        },
+        "hint": "0 表示不限制。"
+      },
+      "global_send_cooldown_minutes": {
+        "description": "全局主动发言冷却（分钟）",
+        "type": "int",
+        "default": 10,
+        "slider": {
+          "min": 0,
+          "max": 1440,
+          "step": 1
+        },
+        "hint": "0 表示不限制。"
+      },
+      "passive_retry_delay_minutes": {
+        "description": "retry_later 延迟（分钟）",
+        "type": "int",
+        "default": 10,
+        "slider": {
+          "min": 1,
+          "max": 1440,
+          "step": 1
+        },
+        "hint": "被动决策选择 retry_later 时，为当前群创建检查点的延迟。"
+      },
+      "seed_checkpoints": {
+        "description": "初始检查点",
+        "type": "list",
+        "default": [],
+        "hint": "可选。插件首次启动时会按此配置创建检查点；使用过的条目不会重复创建。",
+        "items": {
+          "type": "object",
+          "properties": {
+            "session": {
+              "description": "目标会话 UMO 或群号",
+              "type": "string",
+              "default": ""
+            },
+            "platform_id": {
+              "description": "平台实例 ID",
+              "type": "string",
+              "default": ""
+            },
+            "group_id": {
+              "description": "群号",
+              "type": "string",
+              "default": ""
+            },
+            "at": {
+              "description": "计划时间（ISO 8601）",
+              "type": "string",
+              "default": ""
+            },
+            "reason": {
+              "description": "检查原因",
+              "type": "string",
+              "default": ""
+            }
+          }
+        }
+      }
+    }
+  },
+  "agent_limits": {
+    "description": "Agent 循环限制",
+    "type": "object",
+    "hint": "主动注意力 Agent 的单轮轮数、工具调用、检查点修改、主模型调用和输出长度上限。",
+    "items": {
+      "max_agent_rounds": {
+        "description": "主动 Agent 最大轮数",
+        "type": "int",
+        "default": 4,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
+      },
+      "max_tool_calls": {
+        "description": "主动 Agent 最大工具调用次数",
+        "type": "int",
+        "default": 6,
+        "slider": {
+          "min": 0,
+          "max": 50,
+          "step": 1
+        }
+      },
+      "max_checkpoint_mutations": {
+        "description": "单次检查最多修改检查点次数",
+        "type": "int",
+        "default": 2,
+        "slider": {
+          "min": 0,
+          "max": 20,
+          "step": 1
+        }
+      },
+      "max_main_model_calls": {
+        "description": "单次检查最多主模型调用次数",
+        "type": "int",
+        "default": 1,
+        "slider": {
+          "min": 0,
+          "max": 3,
+          "step": 1
+        }
+      },
+      "decision_timeout_seconds": {
+        "description": "兴趣模型超时（秒）",
+        "type": "int",
+        "default": 45,
+        "slider": {
+          "min": 5,
+          "max": 600,
+          "step": 5
+        }
+      },
+      "max_reply_chars": {
+        "description": "主动回复最大字符数",
+        "type": "int",
+        "default": 500,
+        "slider": {
+          "min": 20,
+          "max": 4000,
+          "step": 10
+        }
+      },
+      "max_reason_chars": {
+        "description": "决策理由最大字符数",
+        "type": "int",
+        "default": 200,
+        "slider": {
+          "min": 20,
+          "max": 2000,
+          "step": 10
+        }
+      }
+    }
+  },
+  "budgets": {
+    "description": "预算与策略时限",
+    "type": "object",
+    "hint": "每日模型调用、主动检查、主动发言预算，以及注意力 Agent/主 Agent 自动策略的最长时限。",
+    "items": {
+      "daily_model_call_budget": {
+        "description": "每日模型调用预算",
+        "type": "int",
+        "default": 200,
+        "slider": {
+          "min": 0,
+          "max": 10000,
+          "step": 10
+        },
+        "hint": "兴趣模型和主动回复主模型共享此预算。0 表示禁止所有兴趣/主动模型调用。"
+      },
+      "daily_active_message_budget": {
+        "description": "每日主动发言上限",
+        "type": "int",
+        "default": 10,
+        "slider": {
+          "min": 0,
+          "max": 200,
+          "step": 1
+        }
+      },
+      "daily_active_check_budget": {
+        "description": "每日主动检查上限",
+        "type": "int",
+        "default": 50,
+        "slider": {
+          "min": 0,
+          "max": 2000,
+          "step": 1
+        }
+      },
+      "max_auto_policy_hours": {
+        "description": "注意力 Agent 临时忽略策略最长时间（小时）",
+        "type": "int",
+        "default": 168,
+        "slider": {
+          "min": 1,
+          "max": 8760,
+          "step": 1
+        }
+      },
+      "main_agent_max_policy_hours": {
+        "description": "主 Agent 工具创建忽略策略的默认/上限小时数",
+        "type": "int",
+        "default": 24,
+        "slider": {
+          "min": 1,
+          "max": 8760,
+          "step": 1
+        },
+        "hint": "普通成员通过主模型工具创建忽略策略时受此时限约束；管理员仍可用管理指令创建更长期或永久策略。"
+      },
+      "main_agent_max_intent_hours": {
+        "description": "主 Agent 意图默认/上限小时数",
+        "type": "int",
+        "default": 24,
+        "slider": {
+          "min": 1,
+          "max": 8760,
+          "step": 1
+        },
+        "hint": "关注、话题关注、停止关注和定时检查等主 Agent 意图的有效时间上限。"
+      }
+    }
+  },
+  "safety": {
+    "description": "安全与覆盖",
+    "type": "object",
+    "hint": "管理员/主人覆盖忽略策略等安全选项。",
+    "items": {
+      "owner_override": {
+        "description": "主人覆盖忽略策略",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后管理员/主人不会被用户忽略策略拦截。"
+      }
+    }
   }
 }

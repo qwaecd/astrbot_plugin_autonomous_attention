@@ -157,6 +157,20 @@ class AutonomousAttentionPlugin(Star):
         if self.engine is not None:
             self.engine.update_settings(self.settings)
 
+    def _set_config_value(self, section: str, key: str, value: Any) -> None:
+        """Write one grouped config value and persist it when possible."""
+
+        if not isinstance(self.config, dict):
+            return
+        section_data = self.config.get(section)
+        if not isinstance(section_data, dict):
+            section_data = {}
+            self.config[section] = section_data
+        section_data[key] = value
+        save_config = getattr(self.config, "save_config", None)
+        if callable(save_config):
+            save_config()
+
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
@@ -816,9 +830,8 @@ class AutonomousAttentionPlugin(Star):
             yield event.plain_result("用法：/attention dryrun on|off")
             return
         enabled = args[0].lower() in {"on", "true", "开"}
-        self.config["dry_run"] = enabled
         try:
-            self.config.save_config()
+            self._set_config_value("general", "dry_run", enabled)
         except Exception:
             self.logger.exception("Failed to persist dry_run setting.")
         self._reload_settings()

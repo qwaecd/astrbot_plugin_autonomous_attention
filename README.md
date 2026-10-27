@@ -17,7 +17,7 @@
 
 ## 运行要求
 
-- AstrBot `>= 4.16,<5`
+- AstrBot `>= 4.26,<5`
 - 无额外 Python 依赖
 
 ## 安装与启用
@@ -133,7 +133,18 @@ AstrBot 唤醒事件
 
 ## 配置要点
 
-完整配置项见 `_conf_schema.json`。关键项：
+完整配置项见 `_conf_schema.json`。配置已按 AstrBot 的嵌套 `object` 写法分组，WebUI 中会显示为以下类别：
+
+- `general` 基础设置：`enabled`、`passive_mode`、`active_enabled`、`main_agent_tools_enabled`、`dry_run`、`log_level`、`timezone`、`max_decision_log`、`max_concurrent_decisions`。
+- `models` 模型与人格：`decision_provider_id`、`main_provider_id`、`persona_source`、`custom_persona`、`passive_criteria`、`active_criteria`。
+- `groups` 群聊边界：`group_allowlist`、`blocked_group_ids`。
+- `context` 上下文窗口：`context_window_messages`、`context_max_chars`、`max_context_sessions`。
+- `scheduling` 检查点与冷却：`quiet_hours`、检查间隔、主动发言冷却、`passive_retry_delay_minutes`、`seed_checkpoints`。
+- `agent_limits` Agent 限制：轮数、工具调用、检查点修改、主模型调用、超时和输出长度。
+- `budgets` 预算与策略时限：每日模型/检查/发言预算，注意力 Agent/主 Agent 自动策略时限。
+- `safety` 安全与覆盖：`owner_override`。
+
+关键项说明：
 
 - `passive_mode`：`off` / `block_only` / `full`。
 - `active_enabled`：是否执行检查点。
@@ -142,17 +153,14 @@ AstrBot 唤醒事件
 - `passive_criteria` / `active_criteria`：两条路径使用不同的评判标准；留空使用内置标准。
 - `group_allowlist`：唯一群聊白名单；只有这里面的群可以被观察、建立检查点、执行检查并接收主动消息。为空表示不启用任何群聊的注意力功能。
 - `blocked_group_ids`：完全禁止参与和检查的群（优先级高于 `group_allowlist`）。
-- `context_window_messages` / `context_max_chars`：滑动窗口与上下文上限。
 - `quiet_hours`：例如 `23:00-08:00`，支持跨午夜。
-- `min_interval_minutes` / `max_interval_minutes` / `default_interval_minutes` / `max_defer_minutes`：检查间隔。
-- `group_send_cooldown_minutes` / `global_send_cooldown_minutes`：主动发言冷却。
-- `daily_model_call_budget` / `daily_active_message_budget` / `daily_active_check_budget`：每日预算。
-- `max_agent_rounds` / `max_tool_calls` / `max_checkpoint_mutations` / `max_main_model_calls`：Agent 上限。
 - `max_auto_policy_hours`：注意力 Agent 临时策略最长时间。
 - `main_agent_max_policy_hours` / `main_agent_max_intent_hours`：主模型工具创建忽略策略和意图的默认/上限时间。
 - `main_agent_tools_enabled`：是否允许主模型调用 `attention_*` 工具。
 - `dry_run` / `log_level`：调试与安全开关。
 - `seed_checkpoints`：可选的初始检查点配置；使用过的条目不会重复创建。
+
+> 从旧的平铺配置升级时，AstrBot 会按新 Schema 重建配置结构。请升级后在 WebUI 中检查各分组值；插件仍兼容读取旧的平铺键用于测试/过渡，但新配置会写入分组结构。
 
 ## 数据与隐私
 

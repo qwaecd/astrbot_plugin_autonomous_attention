@@ -215,6 +215,37 @@ def test_main_agent_attention_tools_registered() -> None:
         assert name in names
 
 
+def test_config_schema_is_grouped_and_loads_nested_defaults(tmp_path) -> None:
+    from astrbot.core.config.astrbot_config import AstrBotConfig
+
+    schema_path = Path(__file__).resolve().parent.parent / "_conf_schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    assert set(schema) == {
+        "general",
+        "models",
+        "groups",
+        "context",
+        "scheduling",
+        "agent_limits",
+        "budgets",
+        "safety",
+    }
+    for node in schema.values():
+        assert node["type"] == "object"
+        assert isinstance(node.get("items"), dict) and node["items"]
+
+    config = AstrBotConfig(
+        config_path=str(tmp_path / "plugin_config.json"),
+        schema=schema,
+    )
+    assert config["general"]["passive_mode"] == "block_only"
+    assert config["agent_limits"]["max_agent_rounds"] == 4
+    settings = Settings.from_mapping(dict(config))
+    assert settings.passive_mode == "block_only"
+    assert settings.max_agent_rounds == 4
+    assert settings.group_allowlist == ()
+
+
 @pytest.mark.asyncio
 async def test_main_agent_tool_ignore_and_query(tmp_path, monkeypatch) -> None:
     from astrbot.core.star.star_tools import StarTools

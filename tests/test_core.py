@@ -203,6 +203,46 @@ def test_settings_clamp_and_defaults() -> None:
     assert settings.max_agent_rounds == 1
 
 
+def test_settings_reads_grouped_config() -> None:
+    settings = Settings.from_mapping(
+        {
+            "general": {
+                "enabled": False,
+                "passive_mode": "full",
+                "active_enabled": False,
+                "dry_run": True,
+            },
+            "models": {
+                "decision_provider_id": "decision-provider",
+                "persona_source": "custom",
+                "custom_persona": "测试人格",
+            },
+            "groups": {
+                "group_allowlist": ["g1"],
+                "blocked_group_ids": ["g2"],
+            },
+            "context": {"context_window_messages": 20},
+            "scheduling": {"quiet_hours": "23:00-08:00"},
+            "agent_limits": {"max_agent_rounds": 3},
+            "budgets": {"daily_model_call_budget": 50},
+            "safety": {"owner_override": False},
+        }
+    )
+    assert settings.enabled is False
+    assert settings.passive_mode == "full"
+    assert settings.active_enabled is False
+    assert settings.dry_run is True
+    assert settings.decision_provider_id == "decision-provider"
+    assert settings.custom_persona == "测试人格"
+    assert settings.group_allowlist == ("g1",)
+    assert settings.blocked_group_ids == ("g2",)
+    assert settings.context_window_messages == 20
+    assert settings.quiet_hours == "23:00-08:00"
+    assert settings.max_agent_rounds == 3
+    assert settings.daily_model_call_budget == 50
+    assert settings.owner_override is False
+
+
 @pytest.mark.asyncio
 async def test_store_roundtrip_and_recovery(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
