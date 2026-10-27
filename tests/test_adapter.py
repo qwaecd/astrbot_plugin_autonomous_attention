@@ -16,6 +16,7 @@ PLUGIN_PARENT = Path(__file__).resolve().parent.parent.parent
 if str(PLUGIN_PARENT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_PARENT))
 
+import astrbot_plugin_autonomous_attention.main as main_module  # noqa: E402
 from astrbot_plugin_autonomous_attention.astrbot_adapter import (  # noqa: E402
     AstrBotContextProvider,
     AstrBotMessageSender,
@@ -153,6 +154,133 @@ def test_build_passive_request_from_event() -> None:
     assert passive.group_id == "g"
     assert passive.contexts[0]["content"] == "hi"
     assert passive.timestamp.startswith("2026-01-01")
+
+
+def test_build_passive_request_filters_tool_contexts() -> None:
+    event = SimpleNamespace(
+        unified_msg_origin="p:GroupMessage:g",
+        message_obj=SimpleNamespace(message_id="m1"),
+        message_str="你好",
+        get_platform_id=lambda: "p",
+        get_group_id=lambda: "g",
+        get_sender_id=lambda: "u1",
+        get_sender_name=lambda: "用户",
+        is_admin=lambda: False,
+    )
+    request = SimpleNamespace(
+        system_prompt="sys",
+        contexts=[
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "用户消息"},
+            {"role": "assistant", "content": "普通助手回复"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "call-1"}],
+            },
+            {
+                "role": "tool",
+                "content": "工具结果",
+                "tool_call_id": "call-1",
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "text": "工具结果"}],
+            },
+        ],
+        prompt="你好",
+    )
+
+    passive = build_passive_request(
+        event,
+        request,
+        is_command=False,
+        timestamp="2026-01-01T00:00:00+08:00",
+    )
+
+    assert passive.contexts == [
+        {"role": "user", "content": "用户消息"},
+        {"role": "assistant", "content": "普通助手回复"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_waiting_hook_marks_plugin_request_for_passive_gate():
+    plugin = object.__new__(AutonomousAttentionPlugin)
+    extras = {"provider_request": object()}
+    event = SimpleNamespace(
+        get_extra=lambda key, default=None: extras.get(key, default),
+        set_extra=lambda key, value: extras.__setitem__(key, value),
+    )
+
+    await plugin.mark_non_user_llm_request(event)
+
+    assert extras["_aa_skip_passive"] is True
+
+
+@pytest.mark.asyncio
+async def test_passive_gate_accepts_user_request_after_provider_request_is_set():
+    plugin = object.__new__(AutonomousAttentionPlugin)
+    plugin._ready = True
+    calls: list[object] = []
+
+    async def handle_passive(request):
+        calls.append(request)
+        return SimpleNamespace(block=False)
+
+    plugin.engine = SimpleNamespace(
+        policy=SimpleNamespace(now=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc)),
+        handle_passive=handle_passive,
+    )
+    extras = {"provider_request": object()}
+    event = SimpleNamespace(
+        is_at_or_wake_command=True,
+        message_str="你好",
+        get_extra=lambda key, default=None: extras.get(key, default),
+        set_extra=lambda key, value: extras.__setitem__(key, value),
+        get_platform_name=lambda: "aiocqhttp",
+    )
+
+    original_builder = main_module.build_passive_request
+    main_module.build_passive_request = lambda *args, **kwargs: object()
+    try:
+        await plugin.passive_gate(event, object())
+    finally:
+        main_module.build_passive_request = original_builder
+
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_passive_gate_skips_plugin_and_cron_requests():
+    plugin = object.__new__(AutonomousAttentionPlugin)
+    plugin._ready = True
+    calls: list[object] = []
+
+    async def handle_passive(request):
+        calls.append(request)
+        return SimpleNamespace(block=False)
+
+    plugin.engine = SimpleNamespace(
+        policy=SimpleNamespace(now=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc)),
+        handle_passive=handle_passive,
+    )
+
+    for platform_name, extras in (
+        ("aiocqhttp", {"_aa_skip_passive": True}),
+        ("aiocqhttp", {"cron_payload": {"job_id": "job-1"}}),
+        ("cron", {}),
+    ):
+        event = SimpleNamespace(
+            is_at_or_wake_command=True,
+            message_str="你好",
+            get_extra=lambda key, default=None, values=extras: values.get(key, default),
+            set_extra=lambda key, value, values=extras: values.__setitem__(key, value),
+            get_platform_name=lambda name=platform_name: name,
+        )
+        await plugin.passive_gate(event, object())
+
+    assert calls == []
 
 
 def test_recent_message_roundtrip() -> None:

@@ -273,14 +273,34 @@ def build_passive_request(
     contexts: list[dict[str, Any]] = []
     for item in getattr(request, "contexts", None) or []:
         if isinstance(item, dict):
-            contexts.append(item)
+            dumped = item
         elif hasattr(item, "model_dump"):
             try:
                 dumped = item.model_dump()
-                if isinstance(dumped, dict):
-                    contexts.append(dumped)
             except Exception:
                 continue
+        else:
+            continue
+        if not isinstance(dumped, dict):
+            continue
+
+        role = str(dumped.get("role") or "").lower()
+        if role not in {"user", "assistant"}:
+            continue
+        if dumped.get("tool_call_id") or dumped.get("tool_calls"):
+            continue
+
+        content = dumped.get("content")
+        content_parts = content if isinstance(content, list) else [content]
+        if any(
+            isinstance(part, dict)
+            and str(part.get("type") or "").lower() in {"tool_use", "tool_result"}
+            for part in content_parts
+        ):
+            continue
+        if not content:
+            continue
+        contexts.append({"role": role, "content": content})
     return PassiveRequest(
         umo=str(event.unified_msg_origin),
         platform_id=str(event.get_platform_id() or ""),

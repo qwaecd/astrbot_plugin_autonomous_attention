@@ -172,6 +172,19 @@ class AutonomousAttentionPlugin(Star):
     # Event handlers
     # ------------------------------------------------------------------
 
+    @filter.on_waiting_llm_request(priority=-20000)
+    async def mark_non_user_llm_request(self, event: AstrMessageEvent) -> None:
+        """Mark requests prepared by a plugin before the main-agent build.
+
+        AstrBot stores a normal user's request in ``provider_request`` while
+        building the main agent, after this waiting hook has already run. A
+        plugin-provided request is stored before the hook, so this is the one
+        lifecycle point where the extra still distinguishes the two sources.
+        """
+
+        if event.get_extra("provider_request") is not None:
+            event.set_extra("_aa_skip_passive", True)
+
     @filter.event_message_type(filter.EventMessageType.ALL, priority=20000)
     async def observe_and_guard(self, event: AstrMessageEvent) -> None:
         """Record group context and enforce hard ignore policies.
@@ -245,7 +258,12 @@ class AutonomousAttentionPlugin(Star):
 
         if not self._ready or self.engine is None:
             return
-        if event.get_extra("provider_request") is not None:
+        if (
+            event.get_platform_name() == "cron"
+            or event.get_extra("cron_payload") is not None
+        ):
+            return
+        if event.get_extra("_aa_skip_passive"):
             return
         if not event.is_at_or_wake_command:
             return
