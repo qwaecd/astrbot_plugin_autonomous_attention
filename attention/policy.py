@@ -3,15 +3,23 @@
 Policy decisions always win over interest-model output. The manager only mutates
 the in-memory state object; the caller is responsible for holding the store lock
 and flushing it.
+
+Two budgets are deliberately separate:
+
+* model/semantic-check budget: global plugin gateway calls
+  (``daily_model_call_budget`` / ``daily_active_check_budget``);
+* autonomous participation budget: per-session attempts plus a global cap
+  (``session_autonomous_reply_budget`` / ``daily_autonomous_reply_budget``).
 """
 
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
-from .models import UserPolicy
+from .models import UserPolicy  # noqa: F401  (public typing compatibility)
 from .settings import Settings
 from .timeutil import (
     in_quiet_hours,
@@ -27,20 +35,36 @@ from .timeutil import (
 
 
 class PolicyManager:
-    """Evaluate hard policies and account for model/send budgets."""
+    """Evaluate hard policies and account for model/participation budgets."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.settings = settings
+        self._clock = clock
 
     def update_settings(self, settings: Settings) -> None:
         self.settings = settings
 
     def now(self) -> datetime:
+        """Return the current time, optionally from an injected clock."""
+
+        if self._clock is not None:
+            value = self._clock()
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=self.settings.tz)
+            return value.astimezone(self.settings.tz)
         return current_time(self.settings.tz)
+
+    # ------------------------------------------------------------------
+    # Global plugin gateway budget
+    # ------------------------------------------------------------------
 
     @staticmethod
     def ensure_budget(state: dict[str, Any], moment: datetime) -> dict[str, Any]:
-        """Reset daily counters when the local date changes."""
+        """Reset global daily counters when the local date changes."""
 
         budget = state.setdefault("budget", {})
         date_key = moment.date().isoformat()
@@ -52,6 +76,7 @@ class PolicyManager:
                     "decision_calls": 0,
                     "main_calls": 0,
                     "active_checks": 0,
+                    "autonomous_attempts": 0,
                     "messages_sent": 0,
                 }
             )
@@ -59,6 +84,7 @@ class PolicyManager:
             "decision_calls",
             "main_calls",
             "active_checks",
+            "autonomous_attempts",
             "messages_sent",
         ):
             budget[key] = int(budget.get(key) or 0)
@@ -80,7 +106,7 @@ class PolicyManager:
         moment: datetime,
         kind: str,
     ) -> bool:
-        """Reserve one daily model call.
+        """Reserve one global gateway call.
 
         Args:
             state: Mutable state dictionary.
@@ -89,8 +115,7 @@ class PolicyManager:
                 reply model.
 
         Returns:
-            ``True`` when a call was reserved, ``False`` when the budget is
-            exhausted.
+            ``True`` when a call was reserved.
         """
 
         budget = self.ensure_budget(state, moment)
@@ -117,6 +142,149 @@ class PolicyManager:
             return False
         budget["active_checks"] = int(budget["active_checks"]) + 1
         return True
+
+    # ------------------------------------------------------------------
+    # Session state and autonomous participation quota
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def ensure_session(
+        state: dict[str, Any],
+        umo: str,
+        moment: datetime,
+    ) -> dict[str, Any]:
+        """Return the mutable session state, resetting the daily quota."""
+
+        sessions = state.setdefault("sessions", {})
+        if not isinstance(sessions, dict):
+            sessions = {}
+            state["sessions"] = sessions
+        raw = sessions.get(umo)
+        if not isinstance(raw, dict):
+            raw = {
+                "umo": umo,
+                "external_message_seq": 0,
+                "last_decision_seq": 0,
+                "last_decision_at": "",
+                "next_evaluation_at": "",
+                "last_autonomous_participation_at": str(
+                    ((state.get("send_stats") or {}).get("last_send_by_umo") or {}).get(
+                        umo
+                    )
+                    or ""
+                ),
+                "quota_date": "",
+                "autonomous_attempts": 0,
+                "pending_reply_reservation": "",
+                "revision": 1,
+            }
+            sessions[umo] = raw
+        date_key = moment.date().isoformat()
+        if raw.get("quota_date") != date_key:
+            raw["quota_date"] = date_key
+            raw["autonomous_attempts"] = 0
+        raw["autonomous_attempts"] = int(raw.get("autonomous_attempts") or 0)
+        return raw
+
+    def can_reserve_autonomous(
+        self,
+        state: dict[str, Any],
+        umo: str,
+        moment: datetime,
+    ) -> tuple[bool, str]:
+        """Check session and global autonomous participation resources.
+
+        Args:
+            state: Mutable state dictionary.
+            umo: Session that wants to participate.
+            moment: Current local time.
+
+        Returns:
+            ``(True, "")`` when a reservation may be taken, otherwise
+            ``(False, stable_reason_code)``.
+        """
+
+        if (
+            self.settings.session_autonomous_reply_budget <= 0
+            or self.settings.daily_autonomous_reply_budget <= 0
+        ):
+            return False, "quota_disabled"
+        session = self.ensure_session(state, umo, moment)
+        if session.get("pending_reply_reservation"):
+            return False, "session_busy"
+        if session["autonomous_attempts"] >= (
+            self.settings.session_autonomous_reply_budget
+        ):
+            return False, "session_quota_exhausted"
+        budget = self.ensure_budget(state, moment)
+        if int(budget.get("autonomous_attempts") or 0) >= (
+            self.settings.daily_autonomous_reply_budget
+        ):
+            return False, "global_quota_exhausted"
+        stats = state.setdefault("send_stats", {})
+        if self.settings.global_send_cooldown_minutes > 0:
+            last_global = parse_iso(
+                stats.get("last_autonomous_at") or stats.get("last_send_at"),
+                self.settings.tz,
+            )
+            if last_global is not None:
+                elapsed = (moment - last_global).total_seconds()
+                if elapsed < self.settings.global_send_cooldown_minutes * 60:
+                    return False, "global_cooldown"
+        if self.settings.session_autonomous_cooldown_minutes > 0:
+            last_session = parse_iso(
+                session.get("last_autonomous_participation_at")
+                or ((state.get("send_stats") or {}).get("last_send_by_umo") or {}).get(
+                    umo
+                ),
+                self.settings.tz,
+            )
+            if last_session is not None:
+                elapsed = (moment - last_session).total_seconds()
+                if elapsed < (self.settings.session_autonomous_cooldown_minutes * 60):
+                    return False, "session_cooldown"
+        return True, ""
+
+    def reserve_autonomous(
+        self,
+        state: dict[str, Any],
+        umo: str,
+        moment: datetime,
+    ) -> None:
+        """Atomically record one approved autonomous participation attempt.
+
+        The caller must hold the store lock and have checked
+        :meth:`can_reserve_autonomous` in the same critical section.
+        """
+
+        session = self.ensure_session(state, umo, moment)
+        session["autonomous_attempts"] = int(session["autonomous_attempts"]) + 1
+        session["last_autonomous_participation_at"] = to_iso(moment)
+        session["revision"] = int(session.get("revision") or 1) + 1
+        budget = self.ensure_budget(state, moment)
+        budget["autonomous_attempts"] = int(budget["autonomous_attempts"]) + 1
+        stats = state.setdefault("send_stats", {})
+        stats["last_autonomous_at"] = to_iso(moment)
+
+    def activation_elapsed_seconds(
+        self,
+        state: dict[str, Any],
+        umo: str,
+        moment: datetime,
+    ) -> float | None:
+        """Seconds since the last approved autonomous attempt in ``umo``."""
+
+        session = self.ensure_session(state, umo, moment)
+        last = parse_iso(
+            session.get("last_autonomous_participation_at"), self.settings.tz
+        )
+        if last is None:
+            return None
+        return (moment - last).total_seconds()
+
+    # ------------------------------------------------------------------
+    # Quiet hours and group boundary
+    # ------------------------------------------------------------------
 
     def is_quiet(self, moment: datetime) -> bool:
         return in_quiet_hours(moment, self.settings.quiet_hours)
@@ -184,6 +352,10 @@ class PolicyManager:
             umo,
             platform_id,
         )
+
+    # ------------------------------------------------------------------
+    # Hard user/group ignore policies
+    # ------------------------------------------------------------------
 
     def expire_policies(self, state: dict[str, Any], moment: datetime) -> int:
         """Remove expired policies and return the number removed."""
@@ -287,77 +459,6 @@ class PolicyManager:
         result.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         return result
 
-    def policy_summary(
-        self,
-        state: dict[str, Any],
-        *,
-        group_id: str = "",
-        user_id: str = "",
-        umo: str = "",
-        platform_id: str = "",
-    ) -> str:
-        self.expire_policies(state, self.now())
-        if user_id:
-            policy = self.matching_policy(
-                state,
-                group_id,
-                user_id,
-                umo,
-                platform_id,
-            )
-            if policy:
-                return (
-                    f"当前用户命中忽略策略（{policy.get('reason') or '无原因'}），"
-                    f"到期：{policy.get('expires_at') or '永久'}。"
-                )
-        policies = self.active_policies(state)
-        if not policies:
-            return "当前没有用户或群聊忽略策略。"
-        lines = []
-        for item in policies[:10]:
-            target = item.get("user_id") or item.get("group_id") or "全局"
-            lines.append(
-                f"- {item.get('scope')} {target}，到期 "
-                f"{item.get('expires_at') or '永久'}，原因："
-                f"{str(item.get('reason') or '')[:60]}"
-            )
-        return "\n".join(lines)
-
-    def can_send(
-        self,
-        state: dict[str, Any],
-        *,
-        umo: str,
-        group_id: str,
-        platform_id: str,
-        moment: datetime,
-    ) -> tuple[bool, str]:
-        """Check quiet hours, allowlist, cooldowns and daily send budget."""
-
-        if self.is_quiet(moment):
-            return False, "quiet_hours"
-        if not self.group_allowed(group_id, umo, platform_id):
-            return False, "group_not_allowed"
-        budget = self.ensure_budget(state, moment)
-        if int(budget["messages_sent"]) >= self.settings.daily_active_message_budget:
-            return False, "daily_message_budget_exhausted"
-        stats = state.setdefault("send_stats", {})
-        if self.settings.global_send_cooldown_minutes > 0:
-            last_send = parse_iso(stats.get("last_send_at"), self.settings.tz)
-            if last_send is not None:
-                elapsed = (moment - last_send).total_seconds()
-                if elapsed < self.settings.global_send_cooldown_minutes * 60:
-                    return False, "global_cooldown"
-        if group_id and self.settings.group_send_cooldown_minutes > 0:
-            by_umo = stats.get("last_send_by_umo")
-            if isinstance(by_umo, dict):
-                last_group_send = parse_iso(by_umo.get(umo), self.settings.tz)
-                if last_group_send is not None:
-                    elapsed = (moment - last_group_send).total_seconds()
-                    if elapsed < self.settings.group_send_cooldown_minutes * 60:
-                        return False, "group_cooldown"
-        return True, ""
-
     def record_send(
         self,
         state: dict[str, Any],
@@ -368,6 +469,8 @@ class PolicyManager:
         text: str,
         result: str,
     ) -> None:
+        """Record an actual platform send result for statistics only."""
+
         budget = self.ensure_budget(state, moment)
         budget["messages_sent"] = int(budget["messages_sent"]) + 1
         stats = state.setdefault("send_stats", {})
@@ -388,46 +491,39 @@ class PolicyManager:
         )
         del records[: max(0, len(records) - 100)]
 
-    def describe_budget(self, state: dict[str, Any]) -> str:
-        budget = self.ensure_budget(state, self.now())
-        total = int(budget["decision_calls"]) + int(budget["main_calls"])
-        return (
-            f"日期 {budget['date']}：模型调用 {total}/"
-            f"{self.settings.daily_model_call_budget}，"
-            f"主动检查 {budget['active_checks']}/"
-            f"{self.settings.daily_active_check_budget}，"
-            f"主动发言 {budget['messages_sent']}/"
-            f"{self.settings.daily_active_message_budget}"
-        )
-
     @staticmethod
     def policy_id(scope: str, group_id: str, user_id: str) -> str:
         return f"{scope}:{group_id}:{user_id}"
 
-    def build_policy(
-        self,
-        *,
-        scope: str,
-        group_id: str,
-        user_id: str,
-        reason: str,
-        expires_at: datetime | None,
-        created_by: str,
-        moment: datetime,
-    ) -> UserPolicy:
-        return UserPolicy(
-            policy_id=self.policy_id(scope, group_id, user_id),
-            scope=scope,
-            group_id=group_id,
-            user_id=user_id,
-            mode="ignore",
-            reason=reason,
-            expires_at=to_iso(expires_at) if expires_at else "",
-            created_by=created_by,
-            override="owner" if created_by == "owner" else "",
-            created_at=to_iso(moment),
-            updated_at=to_iso(moment),
-        )
+    def describe_budget(self, state: dict[str, Any], umo: str = "") -> str:
+        budget = self.ensure_budget(state, self.now())
+        total = int(budget["decision_calls"]) + int(budget["main_calls"])
+        parts = [
+            f"日期 {budget['date']}：模型调用 {total}/"
+            f"{self.settings.daily_model_call_budget}，"
+            f"主动检查 {budget['active_checks']}/"
+            f"{self.settings.daily_active_check_budget}，"
+            f"全局自主尝试 {budget['autonomous_attempts']}/"
+            f"{self.settings.daily_autonomous_reply_budget}"
+        ]
+        if umo:
+            session = self.ensure_session(state, umo, self.now())
+            parts.append(
+                f"会话自主尝试 {session['autonomous_attempts']}/"
+                f"{self.settings.session_autonomous_reply_budget}"
+            )
+        return "，".join(parts)
+
+    def debug_dump(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Return a compact, non-sensitive snapshot for logs."""
+
+        return {
+            "policies": len(state.get("policies") or {}),
+            "interests": len(state.get("interests") or {}),
+            "checkpoints": len(state.get("checkpoints") or {}),
+            "now": to_iso(self.now()),
+            "ts": timestamp(self.now()),
+        }
 
     def remaining_quiet_text(self, moment: datetime) -> str:
         end = self.quiet_end(moment)
@@ -438,13 +534,3 @@ class PolicyManager:
             return ""
         minutes = max(1, int((end - moment).total_seconds() // 60))
         return f"静默时段，{minutes} 分钟后结束"
-
-    def debug_dump(self, state: dict[str, Any]) -> dict[str, Any]:
-        """Return a compact, non-sensitive policy snapshot for logs."""
-
-        return {
-            "policies": len(state.get("policies") or {}),
-            "checkpoints": len(state.get("checkpoints") or {}),
-            "now": to_iso(self.now()),
-            "ts": timestamp(self.now()),
-        }

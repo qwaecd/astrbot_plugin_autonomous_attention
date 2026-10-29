@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .models import PassiveDecision, PassiveRequest
+from .models import PassiveDecision, PassiveRequest, RecentMessage
 from .ports import ModelGateway
 from .prompts import build_passive_system_prompt, build_passive_user_prompt
 from .settings import Settings
@@ -41,27 +41,39 @@ class PassiveAttentionRunner:
     async def decide(
         self,
         request: PassiveRequest,
-        topic: dict[str, Any],
+        *,
+        interests: list[dict[str, Any]],
+        checkpoints: list[dict[str, Any]],
         policy_summary: str,
+        opportunities: list[dict[str, Any]],
+        resources: dict[str, Any],
+        window: list[RecentMessage],
     ) -> PassiveRunResult:
-        """Run exactly one interest-model call.
+        """Run exactly one interest-model call with session-scoped data.
 
         Args:
             request: Normalised woken message.
-            topic: Current topic state for the session.
-            policy_summary: Human-readable hard-policy summary.
+            interests: Current session interest candidates.
+            checkpoints: Current session active checkpoints.
+            policy_summary: Human-readable hard-policy/interest summary.
+            opportunities: Recently processed opportunities for the session.
+            resources: Remaining session/global participation resources.
+            window: Session message window with stable IDs.
 
         Returns:
             A result whose ``kind`` is ``ok``, ``invalid`` or ``error``.
-            Callers must treat non-ok results with the documented fallbacks.
         """
 
         system_prompt = build_passive_system_prompt(self.settings)
         user_prompt = build_passive_user_prompt(
             self.settings,
             request,
-            topic,
+            interests,
+            checkpoints,
             policy_summary,
+            opportunities,
+            resources,
+            window,
         )
         result = await self.gateway.generate(
             purpose="decision",

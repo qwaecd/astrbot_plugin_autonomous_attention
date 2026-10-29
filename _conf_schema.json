@@ -250,13 +250,14 @@
       "group_send_cooldown_minutes": {
         "description": "单群主动发言冷却（分钟）",
         "type": "int",
-        "default": 30,
+        "default": -1,
         "slider": {
-          "min": 0,
+          "min": -1,
           "max": 1440,
           "step": 1
         },
-        "hint": "0 表示不限制。"
+        "hint": "已迁移为 attention_limits.session_autonomous_cooldown_minutes；旧键仅在缺少新键时作为回退。",
+        "invisible": true
       },
       "global_send_cooldown_minutes": {
         "description": "全局主动发言冷却（分钟）",
@@ -414,12 +415,14 @@
       "daily_active_message_budget": {
         "description": "每日主动发言上限",
         "type": "int",
-        "default": 10,
+        "default": -1,
         "slider": {
-          "min": 0,
+          "min": -1,
           "max": 200,
           "step": 1
-        }
+        },
+        "hint": "已迁移为 attention_limits.daily_autonomous_reply_budget；旧键仅在缺少新键时作为回退。",
+        "invisible": true
       },
       "daily_active_check_budget": {
         "description": "每日主动检查上限",
@@ -477,5 +480,111 @@
         "hint": "开启后管理员/主人不会被用户忽略策略拦截。"
       }
     }
+  },
+  "attention_limits": {
+    "description": "会话资源与准入限制",
+    "type": "object",
+    "hint": "兴趣容量、期限、检查余额、评估节流以及每会话/全局自主参与配额。",
+    "items": {
+      "max_interests_per_session": {
+        "description": "每会话最大兴趣数",
+        "type": "int",
+        "default": 3,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        },
+        "hint": "watching/paused 都占用槽位。槽位满时只有更高优先级的兴趣可以替换最弱兴趣。"
+      },
+      "interest_ttl_minutes": {
+        "description": "兴趣默认有效期（分钟）",
+        "type": "int",
+        "default": 120,
+        "slider": {
+          "min": 10,
+          "max": 10080,
+          "step": 10
+        },
+        "hint": "只有新的语义相关外部证据才能刷新期限和检查余额。"
+      },
+      "interest_check_limit": {
+        "description": "兴趣检查余额",
+        "type": "int",
+        "default": 3,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        },
+        "hint": "实际进入一次语义评估才扣一次；无新消息等代码跳过不扣。"
+      },
+      "min_evaluation_interval_seconds": {
+        "description": "被动最小语义评估间隔（秒）",
+        "type": "int",
+        "default": 30,
+        "slider": {
+          "min": 1,
+          "max": 3600,
+          "step": 1
+        },
+        "hint": "间隔内的自主接话请求直接 observe，不额外调用模型。"
+      },
+      "opportunity_ttl_minutes": {
+        "description": "参与机会有效期（分钟）",
+        "type": "int",
+        "default": 10,
+        "slider": {
+          "min": 1,
+          "max": 120,
+          "step": 1
+        }
+      },
+      "session_autonomous_reply_budget": {
+        "description": "每会话每日自主参与尝试上限",
+        "type": "int",
+        "default": 6,
+        "slider": {
+          "min": 0,
+          "max": 1000,
+          "step": 1
+        },
+        "hint": "0 表示禁止自主参与；显式请求不计入。"
+      },
+      "session_autonomous_cooldown_minutes": {
+        "description": "每会话自主参与冷却（分钟）",
+        "type": "int",
+        "default": -1,
+        "slider": {
+          "min": -1,
+          "max": 1440,
+          "step": 1
+        },
+        "hint": "-1 表示继承旧配置（默认 10）；显式设置 0 或正数时优先使用本项。"
+      },
+      "daily_autonomous_reply_budget": {
+        "description": "全局每日自主参与尝试上限",
+        "type": "int",
+        "default": -1,
+        "slider": {
+          "min": -1,
+          "max": 10000,
+          "step": 1
+        },
+        "hint": "-1 表示继承旧配置（默认 10）；显式设置 0 或正数时优先使用本项。"
+      }
+    }
+  },
+  "daily_active_message_budget": {
+    "description": "Legacy flat compatibility: daily_active_message_budget",
+    "type": "int",
+    "default": -1,
+    "invisible": true
+  },
+  "group_send_cooldown_minutes": {
+    "description": "Legacy flat compatibility: group_send_cooldown_minutes",
+    "type": "int",
+    "default": -1,
+    "invisible": true
   }
 }

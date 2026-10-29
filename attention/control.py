@@ -1,29 +1,40 @@
 """Unified attention control service.
 
-The main agent, the passive runner and the active runner all mutate policies,
-directives and checkpoints through this service. It validates the operator,
-scope, priority and expiry before writing to the state store. Low-priority
-operators can never overwrite higher-priority state.
+All reads and writes for session-owned resources go through this service. It
+validates the operator, the session scope, source priority and resource
+lifecycle before mutating the state store. Low-priority operators can never
+overwrite higher-priority resources.
+
+The control layer, not the model, decides:
+
+* whether an interest may be admitted or replaced;
+* whether a checkpoint may exist and when it is due;
+* whether an opportunity is a valid, unconsumed anchor;
+* whether an autonomous participation attempt may consume quota.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
-from astrbot.api import logger
-
 from .models import (
+    CHECKPOINT_KINDS,
     DIRECTIVE_TYPES,
+    EXPLICIT_WAKE_SOURCES,
+    INTEREST_ACTIVE_STATUSES,
+    OPPORTUNITY_KINDS,
     SOURCE_ADMIN,
     SOURCE_ATTENTION_AGENT,
     SOURCE_MAIN_AGENT,
     SOURCE_PRIORITIES,
     SOURCE_SYSTEM,
+    Interest,
+    Opportunity,
+    ParticipationApproval,
     UserPolicy,
 )
 from .policy import PolicyManager
@@ -36,8 +47,9 @@ from .timeutil import (
     quiet_hours_end,
     to_iso,
 )
-from .timeutil import (
-    now as current_time,
+
+PASSIVE_SCOPE_CHOICES = frozenset(
+    {"session", "interests", "checkpoints", "directives", "recent", "all"}
 )
 
 
@@ -45,9 +57,8 @@ from .timeutil import (
 class Actor:
     """The real operator behind a control request.
 
-    ``source`` describes the layer making the request. Permission checks also
-    use the real event sender's session and admin flag, never model-supplied
-    text.
+    ``session`` is the trusted UMO of the event; model-provided text is never
+    used to select a target session.
     """
 
     source: str = SOURCE_ATTENTION_AGENT
@@ -90,8 +101,12 @@ def _priority(source: str) -> int:
     return int(SOURCE_PRIORITIES.get(source, 0))
 
 
+def _new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
 class AttentionControlService:
-    """Validate and write attention state changes."""
+    """Validate and write session-scoped attention state."""
 
     def __init__(
         self,
@@ -108,7 +123,7 @@ class AttentionControlService:
         self.policy.update_settings(settings)
 
     def now(self) -> datetime:
-        return current_time(self.settings.tz)
+        return self.policy.now()
 
     # ------------------------------------------------------------------
     # Public async entry points (main-model tools)
@@ -119,16 +134,9 @@ class AttentionControlService:
         actor: Actor,
         *,
         scope: str = "session",
-        target_user: str = "",
     ) -> ControlResult:
         async with self.store.lock:
-            result = self.query_locked(
-                self.store.state,
-                actor,
-                scope=scope,
-                target_user=target_user,
-            )
-        return result
+            return self.query_locked(self.store.state, actor, scope=scope)
 
     async def set_intent(
         self,
@@ -139,6 +147,7 @@ class AttentionControlService:
         reason: str = "",
         expires_in_minutes: int | None = None,
         minutes: int | None = None,
+        interest_id: str = "",
     ) -> ControlResult:
         async with self.store.lock:
             result = self.set_intent_locked(
@@ -149,10 +158,11 @@ class AttentionControlService:
                 reason=reason,
                 expires_in_minutes=expires_in_minutes,
                 minutes=minutes,
+                interest_id=interest_id,
             )
             if result.ok:
                 self._flush_locked()
-        return result
+            return result
 
     async def ignore_user(
         self,
@@ -174,7 +184,7 @@ class AttentionControlService:
             )
             if result.ok:
                 self._flush_locked()
-        return result
+            return result
 
     async def clear_user_policy(
         self,
@@ -192,7 +202,7 @@ class AttentionControlService:
             )
             if result.ok:
                 self._flush_locked()
-        return result
+            return result
 
     async def focus_topic(
         self,
@@ -213,7 +223,7 @@ class AttentionControlService:
             )
             if result.ok:
                 self._flush_locked()
-        return result
+            return result
 
     async def stop_focus(
         self,
@@ -229,7 +239,19 @@ class AttentionControlService:
             )
             if result.ok:
                 self._flush_locked()
-        return result
+            return result
+
+    async def close_interest(self, actor: Actor, interest_id: str) -> ControlResult:
+        async with self.store.lock:
+            result = self.close_interest_locked(
+                self.store.state,
+                actor,
+                interest_id=interest_id,
+                reason="closed by operator",
+            )
+            if result.ok:
+                self._flush_locked()
+            return result
 
     # ------------------------------------------------------------------
     # Query
@@ -241,140 +263,1448 @@ class AttentionControlService:
         actor: Actor,
         *,
         scope: str = "session",
-        target_user: str = "",
     ) -> ControlResult:
         scope = str(scope or "session").strip().lower()
-        if scope not in {"session", "user", "group", "directives", "recent", "all"}:
+        if scope not in PASSIVE_SCOPE_CHOICES:
             return ControlResult(
                 ok=False,
                 code="invalid_scope",
-                message="scope 必须是 session、user、group、directives、recent 或 all。",
+                message=(
+                    "scope 必须是 session、interests、checkpoints、directives、"
+                    "recent 或 all。"
+                ),
             )
         moment = self.now()
-        self.expire_directives_locked(state, moment)
-        group_id = actor.group_id
+        self.expire_interests_locked(state, moment)
+        self.policy.expire_policies(state, moment)
         umo = actor.session
-        platform_id = actor.platform_id
+        if not umo:
+            return ControlResult(
+                ok=False,
+                code="missing_session",
+                message="缺少可信会话标识。",
+            )
+        session = self.policy.ensure_session(state, umo, moment)
         data: dict[str, Any] = {
             "session": {
                 "umo": umo,
-                "group_id": group_id or "",
+                "group_id": actor.group_id or "",
                 "group_allowed": self.policy.group_allowed(
-                    group_id,
+                    actor.group_id,
                     umo,
-                    platform_id,
+                    actor.platform_id,
+                ),
+                "external_message_seq": int(session["external_message_seq"]),
+                "last_decision_seq": int(session["last_decision_seq"]),
+                "last_decision_at": session["last_decision_at"],
+                "autonomous_attempts": int(session["autonomous_attempts"]),
+                "autonomous_attempt_limit": (
+                    self.settings.session_autonomous_reply_budget
+                ),
+                "global_autonomous_attempts": int(
+                    self.policy.ensure_budget(state, moment)["autonomous_attempts"]
+                ),
+                "global_autonomous_attempt_limit": (
+                    self.settings.daily_autonomous_reply_budget
                 ),
             }
         }
-
-        if scope in {"session", "user", "all"}:
-            query_user = target_user or actor.user_id
-            if query_user != actor.user_id and not actor.is_admin:
-                data["user_policy"] = {
-                    "allowed": False,
-                    "reason": "普通成员只能查询自己的忽略状态。",
-                }
-            else:
-                policy = self.policy.matching_policy(
-                    state,
-                    group_id,
-                    query_user,
-                    umo,
-                    platform_id,
-                )
-                data["user_policy"] = {
-                    "target_user": query_user,
-                    "ignored": policy is not None,
-                    "source": (policy or {}).get("source", ""),
-                    "priority": (policy or {}).get("priority", 0),
-                    "expires_at": (policy or {}).get("expires_at", ""),
-                    "reason": _clip((policy or {}).get("reason"), 120),
-                }
-
-        if scope in {"session", "group", "all"}:
-            checkpoints = [
-                dict(raw)
-                for raw in state.get("checkpoints", {}).values()
-                if isinstance(raw, dict)
-                and raw.get("status") in {"active", "running", "paused"}
-                and self._target_matches_group(raw, group_id, umo)
-            ]
-            checkpoints.sort(key=lambda item: str(item.get("scheduled_at") or ""))
-            topic = self._current_topic_locked(state, umo)
-            data["group"] = {
-                "group_id": group_id or "",
-                "blocked": self.policy.group_blocked(
-                    group_id,
-                    umo,
-                    platform_id,
-                ),
-                "active_checkpoints": len(checkpoints),
-                "next_check": (
-                    checkpoints[0].get("scheduled_at", "") if checkpoints else ""
-                ),
-                "topic": {
-                    "topic_id": topic.get("topic_id", ""),
-                    "summary": _clip(topic.get("summary"), 300),
-                    "interest_level": topic.get("interest_level", "none"),
-                    "focus_status": topic.get("focus_status", "idle"),
-                },
-                "stop_focus": bool(
-                    self.stop_directive(
-                        state,
-                        group_id=group_id,
-                        umo=umo,
-                        topic_id=str(topic.get("topic_id") or ""),
-                    )
-                ),
-            }
-
-        if scope in {"session", "group", "directives", "all"}:
-            directives = self.active_directives_locked(
-                state,
-                group_id=group_id,
-                umo=umo,
-            )
+        if scope in {"session", "interests", "all"}:
+            interests = self.session_interests_locked(state, umo)
+            data["interests"] = [self._interest_view(item) for item in interests]
+        if scope in {"session", "checkpoints", "all"}:
+            checkpoints = self.session_checkpoints_locked(state, umo)
+            data["checkpoints"] = [self._checkpoint_view(item) for item in checkpoints]
+        if scope in {"session", "directives", "all"}:
             data["directives"] = [
-                {
-                    "directive_id": item.get("directive_id", ""),
-                    "type": item.get("type", ""),
-                    "target": item.get("target", ""),
-                    "source": item.get("source", ""),
-                    "priority": item.get("priority", 0),
-                    "reason": _clip(item.get("reason"), 120),
-                    "expires_at": item.get("expires_at", ""),
-                }
-                for item in directives[:10]
+                self._directive_view(item)
+                for item in self.session_directives_locked(state, umo)
             ]
-
         if scope in {"session", "recent", "all"}:
             decisions = [
                 item
                 for item in state.get("decisions", [])
                 if isinstance(item, dict) and item.get("umo") == umo
             ][-3:]
-            data["recent"] = [
-                {
-                    "timestamp": item.get("timestamp", ""),
-                    "source": item.get("source", ""),
-                    "decision": item.get("decision", ""),
-                    "interest": item.get("interest", ""),
-                    "reason": _clip(item.get("reason"), 100),
-                    "related_policy_id": item.get("related_policy_id", ""),
-                    "related_directive_id": item.get("related_directive_id", ""),
-                }
-                for item in decisions
-            ]
-
+            data["recent"] = [self._decision_view(item) for item in decisions]
         return ControlResult(
             ok=True,
             code="query_ok",
-            message="已返回当前会话范围内的注意力状态摘要。",
+            message="已返回当前会话的注意力状态。",
             data=data,
         )
 
+    def session_interests_locked(
+        self,
+        state: dict[str, Any],
+        umo: str,
+        *,
+        include_closed: bool = False,
+    ) -> list[dict[str, Any]]:
+        self.expire_interests_locked(state)
+        result: list[dict[str, Any]] = []
+        for raw in (state.get("interests") or {}).values():
+            if not isinstance(raw, dict) or raw.get("umo") != umo:
+                continue
+            if raw.get("quarantine"):
+                continue
+            if not include_closed and raw.get("status") == "closed":
+                continue
+            result.append(dict(raw))
+        result.sort(
+            key=lambda item: (
+                -int(item.get("priority") or 0),
+                str(item.get("updated_at") or ""),
+            )
+        )
+        return result
+
+    def session_checkpoints_locked(
+        self,
+        state: dict[str, Any],
+        umo: str,
+        *,
+        include_finished: bool = False,
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for raw in (state.get("checkpoints") or {}).values():
+            if not isinstance(raw, dict) or raw.get("umo") != umo:
+                continue
+            if raw.get("quarantine"):
+                continue
+            if not include_finished and raw.get("status") not in {
+                "active",
+                "running",
+                "paused",
+            }:
+                continue
+            result.append(dict(raw))
+        result.sort(key=lambda item: str(item.get("scheduled_at") or ""))
+        return result
+
+    def session_directives_locked(
+        self,
+        state: dict[str, Any],
+        umo: str,
+    ) -> list[dict[str, Any]]:
+        self.expire_directives_locked(state)
+        result: list[dict[str, Any]] = []
+        for raw in (state.get("directives") or {}).values():
+            if not isinstance(raw, dict) or raw.get("status") != "active":
+                continue
+            if raw.get("created_by_session") != umo:
+                continue
+            result.append(dict(raw))
+        result.sort(
+            key=lambda item: (
+                -int(item.get("priority") or 0),
+                str(item.get("updated_at") or ""),
+            )
+        )
+        return result
+
+    @staticmethod
+    def _interest_view(raw: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "interest_id": raw.get("interest_id", ""),
+            "summary": _clip(raw.get("summary"), 300),
+            "status": raw.get("status", ""),
+            "source": raw.get("source", ""),
+            "priority": raw.get("priority", 0),
+            "wait_for": _clip(raw.get("wait_for"), 200),
+            "expires_at": raw.get("expires_at", ""),
+            "remaining_checks": raw.get("remaining_checks", 0),
+            "no_progress_count": raw.get("no_progress_count", 0),
+            "evidence_count": len(raw.get("evidence_message_ids") or []),
+        }
+
+    @staticmethod
+    def _checkpoint_view(raw: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "checkpoint_id": raw.get("checkpoint_id", ""),
+            "interest_id": raw.get("interest_id", ""),
+            "kind": raw.get("kind", ""),
+            "status": raw.get("status", ""),
+            "scheduled_at": raw.get("scheduled_at", ""),
+            "expires_at": raw.get("expires_at", ""),
+            "remaining_checks": raw.get("remaining_checks", 0),
+            "reason": _clip(raw.get("reason"), 120),
+            "last_result": raw.get("last_result", ""),
+        }
+
+    @staticmethod
+    def _directive_view(raw: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "directive_id": raw.get("directive_id", ""),
+            "type": raw.get("type", ""),
+            "target": _clip(raw.get("target"), 120),
+            "source": raw.get("source", ""),
+            "priority": raw.get("priority", 0),
+            "expires_at": raw.get("expires_at", ""),
+            "reason": _clip(raw.get("reason"), 120),
+        }
+
+    @staticmethod
+    def _decision_view(raw: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "timestamp": raw.get("timestamp", ""),
+            "kind": raw.get("kind", ""),
+            "decision": raw.get("code_decision") or raw.get("decision", ""),
+            "suggested_action": raw.get("suggested_action", ""),
+            "code": raw.get("rejection_code", ""),
+            "interest_id": raw.get("interest_id", ""),
+            "anchor_message_id": raw.get("anchor_message_id", ""),
+            "reason": _clip(raw.get("reason"), 100),
+        }
+
     # ------------------------------------------------------------------
-    # Intent / directive operations
+    # Interests
+    # ------------------------------------------------------------------
+
+    def admit_interest_locked(
+        self,
+        state: dict[str, Any],
+        actor: Actor,
+        *,
+        summary: str,
+        wait_for: str,
+        evidence_message_ids: list[str],
+        source: str = SOURCE_ATTENTION_AGENT,
+        expires_in_minutes: int | None = None,
+        interest_id: str = "",
+        priority_level: int = 0,
+        moment: datetime | None = None,
+    ) -> ControlResult:
+        """Admit or update one session-owned interest.
+
+        Args:
+            state: Mutable state dictionary.
+            actor: Trusted operator; ``actor.session`` is the owner.
+            summary: Bounded interest summary.
+            wait_for: Concrete condition to wait for.
+            evidence_message_ids: External message IDs that justify the interest.
+            source: ``main_agent`` or ``attention_agent``.
+            expires_in_minutes: Requested TTL; clamped by configuration.
+            interest_id: Existing interest to update, if any.
+            priority_level: Discrete 0-2 evidence level generated by code.
+            moment: Current time, injectable for tests.
+
+        Returns:
+            A control result whose data contains the stored interest.
+        """
+
+        moment = moment or self.now()
+        umo = actor.session
+        if not umo:
+            return ControlResult(
+                ok=False, code="missing_session", message="缺少可信会话标识。"
+            )
+        if self._owner_mismatch(umo, actor.platform_id, actor.group_id):
+            return ControlResult(
+                ok=False, code="scope_mismatch", message="Session route mismatch."
+            )
+        self.expire_interests_locked(state, moment)
+        binding = self.policy.ensure_session(state, umo, moment)
+        if (
+            binding.get("group_id")
+            and actor.group_id
+            and binding["group_id"] != actor.group_id
+        ):
+            return ControlResult(
+                ok=False, code="scope_mismatch", message="会话路由冲突。"
+            )
+        if actor.platform_id:
+            binding["platform_id"] = actor.platform_id
+        if actor.group_id:
+            binding["group_id"] = actor.group_id
+        summary = _clip(summary, 300)
+        wait_for = _clip(wait_for, 300)
+        if self._owner_mismatch(umo, actor.platform_id, actor.group_id):
+            return ControlResult(
+                ok=False,
+                code="scope_mismatch",
+                message="会话、平台与群号不一致，不能创建兴趣。",
+            )
+        if not summary:
+            return ControlResult(
+                ok=False, code="missing_summary", message="兴趣摘要不能为空。"
+            )
+        if not wait_for:
+            return ControlResult(
+                ok=False,
+                code="missing_wait_for",
+                message="新兴趣必须提供具体的等待条件。",
+            )
+        evidence = self._valid_evidence_locked(
+            state,
+            umo,
+            evidence_message_ids,
+        )
+        if not evidence:
+            return ControlResult(
+                ok=False,
+                code="missing_evidence",
+                message="新兴趣必须引用本会话的外部证据消息。",
+            )
+        if not self._actor_can_write_source(actor, source):
+            return ControlResult(
+                ok=False,
+                code="permission_denied",
+                message="当前操作者不能写入该来源的兴趣。",
+            )
+        expires_at = self._resolve_expiry(
+            actor,
+            max_hours=self.settings.main_agent_max_intent_hours,
+            requested_minutes=expires_in_minutes,
+            allow_permanent=False,
+            default_minutes=self.settings.interest_ttl_minutes,
+        )
+        if expires_at is None:
+            expires_at = add_minutes(
+                moment, max(1, int(self.settings.interest_ttl_minutes))
+            )
+        if source == SOURCE_ATTENTION_AGENT:
+            expires_at = min(
+                expires_at,
+                add_minutes(moment, max(1, int(self.settings.interest_ttl_minutes))),
+            )
+
+        existing: dict[str, Any] | None = None
+        if interest_id:
+            raw = (state.get("interests") or {}).get(interest_id)
+            if not isinstance(raw, dict) or raw.get("umo") != umo:
+                return ControlResult(
+                    ok=False,
+                    code="interest_not_found",
+                    message="当前会话不存在该兴趣。",
+                )
+            if raw.get("status") == "closed" or raw.get("quarantine"):
+                return ControlResult(
+                    ok=False,
+                    code="interest_expired",
+                    message="Interest is closed or quarantined.",
+                )
+            existing = raw
+        else:
+            for raw in (state.get("interests") or {}).values():
+                if not isinstance(raw, dict):
+                    continue
+                if raw.get("umo") != umo:
+                    continue
+                if raw.get("status") == "closed":
+                    continue
+                if str(raw.get("summary") or "").casefold() == summary.casefold():
+                    existing = raw
+                    break
+
+        priority = _priority(source) + max(0, min(2, int(priority_level)))
+        if existing is not None:
+            existing_priority = int(existing.get("priority") or 0)
+            if existing_priority > priority and not actor.is_admin:
+                return ControlResult(
+                    ok=False,
+                    code="higher_priority_interest_exists",
+                    message="存在更高优先级的兴趣，当前请求不能覆盖。",
+                )
+            if existing.get("source") == SOURCE_ADMIN and not actor.is_admin:
+                return ControlResult(
+                    ok=False,
+                    code="admin_interest_protected",
+                    message="管理员兴趣不能被覆盖。",
+                )
+            existing_evidence = [
+                str(item) for item in existing.get("evidence_message_ids") or []
+            ]
+            fresh_ids = {
+                str(item.get("message_id") or "")
+                for item in (state.get("recent_messages") or {}).get(umo, [])
+                if isinstance(item, dict)
+                and int(item.get("seq") or 0)
+                > int(existing.get("last_evaluated_seq") or 0)
+            }
+            new_evidence = [
+                item
+                for item in evidence
+                if item not in existing_evidence and item in fresh_ids
+            ]
+            existing.update(
+                {
+                    "summary": summary,
+                    "wait_for": wait_for,
+                    "expires_at": to_iso(expires_at)
+                    if new_evidence
+                    else str(existing.get("expires_at") or ""),
+                    "remaining_checks": max(
+                        int(existing.get("remaining_checks") or 0),
+                        self.settings.interest_check_limit,
+                    )
+                    if new_evidence
+                    else int(existing.get("remaining_checks") or 0),
+                    "priority": max(existing_priority, priority),
+                    "source": source
+                    if priority >= existing_priority
+                    else existing.get("source"),
+                    "evidence_message_ids": self._merge_evidence(
+                        existing_evidence,
+                        evidence,
+                    ),
+                    "last_external_evidence_at": to_iso(moment)
+                    if new_evidence
+                    else str(existing.get("last_external_evidence_at") or ""),
+                    "updated_at": to_iso(moment),
+                    "revision": int(existing.get("revision") or 1) + 1,
+                }
+            )
+            if new_evidence:
+                existing["no_progress_count"] = 0
+            return ControlResult(
+                ok=True,
+                code="interest_updated",
+                message="已有兴趣已更新。",
+                data={"interest": dict(existing)},
+            )
+
+        active = [
+            item
+            for item in self.session_interests_locked(state, umo)
+            if item.get("status") in INTEREST_ACTIVE_STATUSES
+        ]
+        if len(active) >= self.settings.max_interests_per_session:
+            replaceable = self._weakest_replacement_locked(active)
+            if replaceable is None or int(replaceable.get("priority") or 0) >= priority:
+                return ControlResult(
+                    ok=False,
+                    code="interest_capacity_exhausted",
+                    message="本会话兴趣槽位已满，且没有可替换的低优先级兴趣。",
+                    data={"active": len(active)},
+                )
+            self.close_interest_locked(
+                state,
+                Actor(
+                    source=SOURCE_SYSTEM,
+                    session=umo,
+                    group_id=actor.group_id,
+                    platform_id=actor.platform_id,
+                    is_admin=True,
+                ),
+                interest_id=str(replaceable["interest_id"]),
+                reason="replaced by higher-priority interest",
+                moment=moment,
+            )
+
+        interest = Interest(
+            interest_id=_new_id("i"),
+            umo=umo,
+            platform_id=actor.platform_id,
+            group_id=actor.group_id,
+            summary=summary,
+            status="watching",
+            source=source,
+            priority=priority,
+            directive_id="",
+            evidence_message_ids=evidence,
+            wait_for=wait_for,
+            last_external_evidence_at=to_iso(moment),
+            expires_at=to_iso(expires_at),
+            remaining_checks=self.settings.interest_check_limit,
+            no_progress_count=0,
+            last_evaluated_seq=0,
+            created_at=to_iso(moment),
+            updated_at=to_iso(moment),
+            revision=1,
+        ).to_dict()
+        state.setdefault("interests", {})[interest["interest_id"]] = interest
+        return ControlResult(
+            ok=True,
+            code="interest_admitted",
+            message="兴趣已准入。",
+            data={"interest": dict(interest)},
+        )
+
+    def close_interest_locked(
+        self,
+        state: dict[str, Any],
+        actor: Actor,
+        *,
+        interest_id: str,
+        reason: str,
+        moment: datetime | None = None,
+    ) -> ControlResult:
+        moment = moment or self.now()
+        raw = (state.get("interests") or {}).get(interest_id)
+        if not isinstance(raw, dict) or raw.get("umo") != actor.session:
+            return ControlResult(
+                ok=False,
+                code="interest_not_found",
+                message="当前会话不存在该兴趣。",
+            )
+        if raw.get("source") == SOURCE_ADMIN and not actor.is_admin:
+            return ControlResult(
+                ok=False,
+                code="admin_interest_protected",
+                message="管理员兴趣不能被普通操作关闭。",
+            )
+        if (
+            raw.get("source") == SOURCE_MAIN_AGENT
+            and actor.source == SOURCE_ATTENTION_AGENT
+            and not actor.is_admin
+        ):
+            return ControlResult(
+                ok=False,
+                code="main_agent_interest_protected",
+                message="注意力 Agent 不能关闭主 Agent 的兴趣。",
+            )
+        raw["status"] = "closed"
+        raw["updated_at"] = to_iso(moment)
+        raw["revision"] = int(raw.get("revision") or 1) + 1
+        raw["close_reason"] = _clip(reason, 120)
+        cancelled: list[str] = []
+        for checkpoint in (state.get("checkpoints") or {}).values():
+            if not isinstance(checkpoint, dict):
+                continue
+            if checkpoint.get("umo") != actor.session:
+                continue
+            if checkpoint.get("interest_id") != interest_id:
+                continue
+            if checkpoint.get("status") in {"active", "running", "paused"}:
+                checkpoint["status"] = (
+                    "completed" if reason == "end_focus" else "cancelled"
+                )
+                checkpoint["scheduled_at"] = ""
+                checkpoint["last_result"] = (
+                    "end_focus" if reason == "end_focus" else "interest_closed"
+                )
+                checkpoint["updated_at"] = to_iso(moment)
+                checkpoint["revision"] = int(checkpoint.get("revision") or 1) + 1
+                cancelled.append(str(checkpoint.get("checkpoint_id") or ""))
+        for opportunity in (state.get("opportunities") or {}).values():
+            if not isinstance(opportunity, dict):
+                continue
+            if opportunity.get("umo") != actor.session:
+                continue
+            if opportunity.get("interest_id") != interest_id:
+                continue
+            if opportunity.get("status") == "pending":
+                opportunity["status"] = "expired"
+                opportunity["outcome"] = "interest_closed"
+                opportunity["updated_at"] = to_iso(moment)
+                opportunity["revision"] = int(opportunity.get("revision") or 1) + 1
+        return ControlResult(
+            ok=True,
+            code="interest_closed",
+            message="兴趣已关闭。",
+            data={
+                "interest_id": interest_id,
+                "cancelled_checkpoints": cancelled,
+            },
+        )
+
+    def touch_interest_evidence_locked(
+        self,
+        state: dict[str, Any],
+        interest_id: str,
+        evidence_message_ids: list[str],
+        *,
+        moment: datetime | None = None,
+        reset_checks: bool = True,
+    ) -> bool:
+        """Refresh an interest after semantically relevant external evidence."""
+
+        moment = moment or self.now()
+        raw = (state.get("interests") or {}).get(interest_id)
+        if not isinstance(raw, dict) or raw.get("status") == "closed":
+            return False
+        evidence = self._valid_evidence_locked(
+            state, str(raw.get("umo") or ""), evidence_message_ids
+        )
+        known = set(raw.get("evidence_message_ids") or [])
+        progress = int(raw.get("last_evaluated_seq") or 0)
+        fresh = {
+            str(item.get("message_id") or "")
+            for item in (state.get("recent_messages") or {}).get(raw.get("umo"), [])
+            if isinstance(item, dict) and int(item.get("seq") or 0) > progress
+        }
+        evidence = [item for item in evidence if item not in known and item in fresh]
+        expires = parse_iso(raw.get("expires_at"), self.settings.tz)
+        if not evidence or expires is None or expires <= moment:
+            return False
+        raw["evidence_message_ids"] = self._merge_evidence(
+            raw.get("evidence_message_ids") or [],
+            evidence,
+        )
+        raw["last_external_evidence_at"] = to_iso(moment)
+        raw["no_progress_count"] = 0
+        if reset_checks:
+            raw["remaining_checks"] = self.settings.interest_check_limit
+            raw["expires_at"] = to_iso(
+                add_minutes(
+                    moment,
+                    max(1, int(self.settings.interest_ttl_minutes)),
+                )
+            )
+        raw["updated_at"] = to_iso(moment)
+        raw["revision"] = int(raw.get("revision") or 1) + 1
+        return True
+
+    def _weakest_replacement_locked(
+        self,
+        active: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        replaceable = [item for item in active if item.get("source") != SOURCE_ADMIN]
+        if not replaceable:
+            return None
+        replaceable.sort(
+            key=lambda item: (
+                int(item.get("priority") or 0),
+                -int(item.get("no_progress_count") or 0),
+                str(item.get("last_external_evidence_at") or ""),
+                str(item.get("interest_id") or ""),
+            )
+        )
+        return replaceable[0]
+
+    @staticmethod
+    def _merge_evidence(existing: list[Any], incoming: list[str]) -> list[str]:
+        merged: list[str] = []
+        for item in [*existing, *incoming]:
+            text = str(item).strip()
+            if text and text not in merged:
+                merged.append(text)
+        return merged[-50:]
+
+    def _valid_evidence_locked(
+        self,
+        state: dict[str, Any],
+        umo: str,
+        evidence_message_ids: list[str],
+    ) -> list[str]:
+        window = {
+            str(item.get("message_id") or "")
+            for item in (state.get("recent_messages") or {}).get(umo, [])
+            if isinstance(item, dict)
+            and not item.get("is_bot")
+            and int(item.get("seq") or 0) > 0
+            and parse_iso(item.get("created_at"), self.settings.tz) is not None
+            and parse_iso(item.get("created_at"), self.settings.tz) <= self.now()
+            and parse_iso(item.get("created_at"), self.settings.tz)
+            > self.now() - timedelta(minutes=self.settings.interest_ttl_minutes)
+        }
+        result: list[str] = []
+        for item in evidence_message_ids or []:
+            text = str(item).strip()
+            if text and text in window and text not in result:
+                result.append(text)
+        return result[-20:]
+
+    # ------------------------------------------------------------------
+    # Checkpoints
+    # ------------------------------------------------------------------
+
+    def create_checkpoint_locked(
+        self,
+        state: dict[str, Any],
+        actor: Actor,
+        *,
+        umo: str,
+        platform_id: str,
+        group_id: str,
+        kind: str,
+        scheduled_at: datetime | None = None,
+        minutes: int | None = None,
+        reason: str = "",
+        source: str = SOURCE_ATTENTION_AGENT,
+        interest_id: str = "",
+        directive_id: str = "",
+        moment: datetime | None = None,
+    ) -> ControlResult:
+        """Create or merge a checkpoint inside one session.
+
+        An interest-bound checkpoint is unique per ``(umo, interest_id)`` while
+        unfinished. A session scan is unique per ``umo``.
+        """
+
+        moment = moment or self.now()
+        if not umo:
+            return ControlResult(
+                ok=False, code="missing_session", message="检查点必须属于一个会话。"
+            )
+        self.expire_interests_locked(state, moment)
+        if actor.session != umo or not self._actor_can_write_source(actor, source):
+            return ControlResult(
+                ok=False,
+                code="scope_mismatch",
+                message="检查点必须使用可信操作者的会话和来源。",
+            )
+        if source == SOURCE_ATTENTION_AGENT and kind == "session_scan":
+            return ControlResult(
+                ok=False,
+                code="permission_denied",
+                message="注意力模型不能创建会话扫描器。",
+            )
+        if self._owner_mismatch(umo, platform_id, group_id):
+            return ControlResult(
+                ok=False,
+                code="scope_mismatch",
+                message="会话、平台与群号不一致，不能创建检查点。",
+            )
+        if not group_id:
+            return ControlResult(
+                ok=False,
+                code="missing_group",
+                message="主动检查目前只支持群聊会话。",
+            )
+        if not self.policy.group_allowed(group_id, umo, platform_id):
+            return ControlResult(
+                ok=False,
+                code="group_not_allowed",
+                message="目标群不在群聊白名单中。",
+            )
+        kind = str(kind or "").strip()
+        if kind not in CHECKPOINT_KINDS:
+            return ControlResult(
+                ok=False, code="invalid_kind", message="不支持的检查点类型。"
+            )
+        if kind == "interest":
+            interest = (state.get("interests") or {}).get(interest_id)
+            if (
+                not isinstance(interest, dict)
+                or interest.get("umo") != umo
+                or interest.get("status") == "closed"
+            ):
+                return ControlResult(
+                    ok=False,
+                    code="interest_not_found",
+                    message="检查点必须引用本会话中仍然有效的兴趣。",
+                )
+            expires_at = parse_iso(interest.get("expires_at"), self.settings.tz)
+            remaining_checks = int(interest.get("remaining_checks") or 0)
+        else:
+            interest = None
+            interest_id = ""
+            expires_at = add_minutes(
+                moment, max(1, int(self.settings.interest_ttl_minutes))
+            )
+            remaining_checks = self.settings.interest_check_limit
+
+        if scheduled_at is None:
+            scheduled_at = self._next_schedule(
+                moment,
+                minutes,
+                expires_at,
+            )
+        else:
+            scheduled_at = self._clamp_schedule(moment, scheduled_at, expires_at)
+        if expires_at is not None and scheduled_at >= expires_at:
+            return ControlResult(
+                ok=False,
+                code="interest_expired",
+                message="检查点计划时间已经晚于资源到期时间。",
+            )
+
+        for raw in (state.get("checkpoints") or {}).values():
+            if not isinstance(raw, dict) or raw.get("umo") != umo:
+                continue
+            if raw.get("status") not in {"active", "running", "paused"}:
+                continue
+            same_interest = kind == "interest" and raw.get("interest_id") == interest_id
+            same_scan = kind == "session_scan" and raw.get("kind") == "session_scan"
+            if not (same_interest or same_scan):
+                continue
+            if int(raw.get("priority") or 0) > _priority(source) and not actor.is_admin:
+                return ControlResult(
+                    ok=False,
+                    code="higher_priority_checkpoint_exists",
+                    message="A protected checkpoint already exists.",
+                )
+            raw["scheduled_at"] = to_iso(scheduled_at)
+            raw["reason"] = _clip(reason or raw.get("reason"), 200)
+            raw["updated_at"] = to_iso(moment)
+            raw["revision"] = int(raw.get("revision") or 1) + 1
+            return ControlResult(
+                ok=True,
+                code="checkpoint_merged",
+                message="检查点已合并到本会话现有任务。",
+                data={"checkpoint": dict(raw), "merged": True},
+            )
+
+        checkpoint = {
+            "checkpoint_id": _new_id("cp"),
+            "umo": umo,
+            "platform_id": platform_id,
+            "group_id": group_id,
+            "interest_id": interest_id,
+            "kind": kind,
+            "scheduled_at": to_iso(scheduled_at),
+            "status": "active",
+            "reason": _clip(reason, 200),
+            "last_result": "",
+            "source": source,
+            "priority": _priority(source),
+            "directive_id": directive_id,
+            "created_by_session": actor.session,
+            "expires_at": to_iso(expires_at) if expires_at else "",
+            "remaining_checks": max(0, int(remaining_checks)),
+            "no_progress_count": int((interest or {}).get("no_progress_count") or 0),
+            "revision": 1,
+            "created_at": to_iso(moment),
+            "updated_at": to_iso(moment),
+            "last_run_at": "",
+            "last_error": "",
+            "run_id": "",
+            "attempts": 0,
+        }
+        state.setdefault("checkpoints", {})[checkpoint["checkpoint_id"]] = checkpoint
+        self._record_decision_locked(
+            state,
+            umo=umo,
+            kind="control",
+            trigger=actor.source,
+            code_decision="checkpoint_saved",
+            reason=reason or "checkpoint saved",
+            interest_id=interest_id,
+            checkpoint_id=checkpoint["checkpoint_id"],
+        )
+        return ControlResult(
+            ok=True,
+            code="checkpoint_saved",
+            message="检查点已创建。",
+            data={"checkpoint": dict(checkpoint), "merged": False},
+        )
+
+    def claim_checkpoint_locked(
+        self,
+        state: dict[str, Any],
+        checkpoint_id: str,
+        *,
+        moment: datetime | None = None,
+        force: bool = False,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Claim one checkpoint for execution under the store lock."""
+
+        moment = moment or self.now()
+        raw = (state.get("checkpoints") or {}).get(checkpoint_id)
+        if not isinstance(raw, dict):
+            return None, "checkpoint_not_found"
+        if raw.get("quarantine"):
+            return None, "scope_mismatch"
+        if raw.get("status") == "running":
+            return None, "checkpoint_running"
+        if any(
+            isinstance(other, dict)
+            and other.get("umo") == raw.get("umo")
+            and other.get("status") == "running"
+            for other in (state.get("checkpoints") or {}).values()
+        ):
+            return None, "session_busy"
+        if raw.get("status") not in {"active", "paused"}:
+            return None, "checkpoint_status"
+        umo = str(raw.get("umo") or "")
+        if not self.policy.group_allowed(
+            str(raw.get("group_id") or ""),
+            umo,
+            str(raw.get("platform_id") or ""),
+        ):
+            return None, "group_not_allowed"
+        expires_at = parse_iso(raw.get("expires_at"), self.settings.tz)
+        if expires_at is None or expires_at <= moment:
+            raw["status"] = "cancelled"
+            raw["last_result"] = "expired"
+            raw["updated_at"] = to_iso(moment)
+            raw["revision"] = int(raw.get("revision") or 1) + 1
+            return None, "checkpoint_expired"
+        if int(raw.get("remaining_checks") or 0) <= 0:
+            raw["status"] = "completed"
+            raw["last_result"] = "checks_exhausted"
+            raw["updated_at"] = to_iso(moment)
+            raw["revision"] = int(raw.get("revision") or 1) + 1
+            return None, "checks_exhausted"
+        if raw.get("kind") == "interest":
+            interest = (state.get("interests") or {}).get(raw.get("interest_id"))
+            if (
+                not isinstance(interest, dict)
+                or interest.get("status") != "watching"
+                or interest.get("quarantine")
+                or interest.get("umo") != umo
+            ):
+                raw["status"] = "cancelled"
+                raw["last_result"] = "interest_closed"
+                raw["updated_at"] = to_iso(moment)
+                raw["revision"] = int(raw.get("revision") or 1) + 1
+                return None, "interest_closed"
+        scheduled = parse_iso(raw.get("scheduled_at"), self.settings.tz)
+        if not force and scheduled is not None and scheduled > moment:
+            return None, "checkpoint_not_due"
+        raw["status"] = "running"
+        raw["run_id"] = uuid.uuid4().hex[:12]
+        raw["last_run_at"] = to_iso(moment)
+        raw["attempts"] = int(raw.get("attempts") or 0) + 1
+        raw["forced"] = bool(force)
+        raw["revision"] = int(raw.get("revision") or 1) + 1
+        raw["updated_at"] = to_iso(moment)
+        return dict(raw), ""
+
+    def finalize_checkpoint_locked(
+        self,
+        state: dict[str, Any],
+        checkpoint_id: str,
+        *,
+        status: str,
+        scheduled_at: str,
+        last_result: str,
+        last_error: str,
+        moment: datetime,
+        evaluated: bool = False,
+        no_progress: bool = False,
+    ) -> ControlResult:
+        """Write the operational result of one checkpoint run."""
+
+        raw = (state.get("checkpoints") or {}).get(checkpoint_id)
+        if not isinstance(raw, dict):
+            return ControlResult(
+                ok=False,
+                code="checkpoint_not_found",
+                message="检查点不存在。",
+            )
+        raw["status"] = status
+        raw["scheduled_at"] = scheduled_at if status in {"active", "paused"} else ""
+        raw["last_result"] = last_result
+        raw["last_error"] = _clip(last_error, 300)
+        raw["run_id"] = ""
+        raw.pop("forced", None)
+        raw["updated_at"] = to_iso(moment)
+        raw["revision"] = int(raw.get("revision") or 1) + 1
+        interest_id = str(raw.get("interest_id") or "")
+        interest = (state.get("interests") or {}).get(interest_id)
+        if isinstance(interest, dict) and interest.get("umo") == raw.get("umo"):
+            raw["remaining_checks"] = int(interest.get("remaining_checks") or 0)
+            raw["no_progress_count"] = int(interest.get("no_progress_count") or 0)
+            raw["expires_at"] = interest.get("expires_at", "")
+        if evaluated:
+            raw["remaining_checks"] = max(0, int(raw.get("remaining_checks") or 0) - 1)
+        if no_progress:
+            raw["no_progress_count"] = int(raw.get("no_progress_count") or 0) + 1
+        if isinstance(interest, dict) and interest.get("umo") == raw.get("umo"):
+            session = (state.get("sessions") or {}).get(str(raw.get("umo") or ""))
+            session_seq = int((session or {}).get("last_decision_seq") or 0)
+            if evaluated:
+                interest["last_evaluated_seq"] = max(
+                    int(interest.get("last_evaluated_seq") or 0),
+                    session_seq,
+                )
+            interest["remaining_checks"] = int(raw.get("remaining_checks") or 0)
+            interest["no_progress_count"] = int(raw.get("no_progress_count") or 0)
+            interest["updated_at"] = to_iso(moment)
+            interest["revision"] = int(interest.get("revision") or 1) + 1
+        expires = parse_iso(raw.get("expires_at"), self.settings.tz)
+        if (
+            int(raw.get("remaining_checks") or 0) <= 0
+            or int(raw.get("no_progress_count") or 0) >= self.settings.no_progress_limit
+            or (expires is not None and expires <= moment)
+        ):
+            raw["status"] = "completed"
+            raw["scheduled_at"] = ""
+            if isinstance(interest, dict) and interest.get("status") != "closed":
+                self.close_interest_locked(
+                    state,
+                    Actor(
+                        source=SOURCE_SYSTEM,
+                        session=str(raw.get("umo") or ""),
+                        is_admin=True,
+                    ),
+                    interest_id=interest_id,
+                    reason="lifecycle_exhausted",
+                    moment=moment,
+                )
+        return ControlResult(
+            ok=True,
+            code="checkpoint_finalized",
+            message="检查点结果已保存。",
+            data=dict(raw),
+        )
+
+    def set_checkpoint_status_locked(
+        self,
+        state: dict[str, Any],
+        actor: Actor,
+        checkpoint_id: str,
+        status: str,
+        *,
+        moment: datetime | None = None,
+        scheduled_at: str | None = None,
+    ) -> ControlResult:
+        raw = (state.get("checkpoints") or {}).get(checkpoint_id)
+        if not isinstance(raw, dict):
+            return ControlResult(
+                ok=False,
+                code="checkpoint_not_found",
+                message="检查点不存在。",
+            )
+        if raw.get("umo") != actor.session:
+            return ControlResult(
+                ok=False,
+                code="scope_mismatch",
+                message="不能修改其他会话的检查点。",
+            )
+        source = str(raw.get("source") or SOURCE_ATTENTION_AGENT)
+        if not actor.is_admin and actor.source != SOURCE_SYSTEM:
+            if source == SOURCE_ADMIN:
+                return ControlResult(
+                    ok=False,
+                    code="admin_checkpoint_protected",
+                    message="管理员创建的检查点不能被当前操作者修改。",
+                )
+            if (
+                actor.source == SOURCE_ATTENTION_AGENT
+                and source != SOURCE_ATTENTION_AGENT
+            ):
+                return ControlResult(
+                    ok=False,
+                    code="permission_denied",
+                    message="注意力 Agent 不能修改主 Agent 的检查点。",
+                )
+        moment = moment or self.now()
+        raw["status"] = status
+        if status == "cancelled":
+            raw["scheduled_at"] = ""
+        elif scheduled_at is not None:
+            raw["scheduled_at"] = scheduled_at
+        raw["updated_at"] = to_iso(moment)
+        raw["revision"] = int(raw.get("revision") or 1) + 1
+        return ControlResult(
+            ok=True,
+            code="checkpoint_updated",
+            message="检查点状态已更新。",
+            data=dict(raw),
+        )
+
+    # ------------------------------------------------------------------
+    # Opportunities and participation admission
+    # ------------------------------------------------------------------
+
+    def create_opportunity_locked(
+        self,
+        state: dict[str, Any],
+        *,
+        umo: str,
+        interest_id: str,
+        kind: str,
+        anchor_message_id: str,
+        evidence_message_ids: list[str],
+        expected_contribution: str,
+        moment: datetime | None = None,
+        valid_ids: set[str] | None = None,
+        bot_ids: set[str] | None = None,
+        allow_direct: bool = False,
+    ) -> ControlResult:
+        """Create one pending opportunity or return the existing anchor record."""
+
+        moment = moment or self.now()
+        kind = str(kind or "").strip()
+        if kind not in OPPORTUNITY_KINDS:
+            return ControlResult(
+                ok=False,
+                code="invalid_opportunity_kind",
+                message="不支持的参与机会类型。",
+            )
+        if kind == "direct_request" and not allow_direct:
+            return ControlResult(
+                ok=False,
+                code="invalid_opportunity_kind",
+                message="自主路径不能创建 direct_request 机会。",
+            )
+        expected_contribution = _clip(expected_contribution, 500)
+        if not expected_contribution:
+            return ControlResult(
+                ok=False,
+                code="missing_contribution",
+                message="参与机会必须说明预计新增的具体内容。",
+            )
+        anchor = str(anchor_message_id or "").strip()
+        if not anchor:
+            return ControlResult(
+                ok=False,
+                code="missing_anchor",
+                message="参与机会必须引用一条锚点消息。",
+            )
+        if valid_ids is not None and anchor not in valid_ids:
+            return ControlResult(
+                ok=False,
+                code="invalid_anchor",
+                message="锚点消息不属于本会话的可用窗口。",
+            )
+        if bot_ids is not None and anchor in bot_ids:
+            return ControlResult(
+                ok=False,
+                code="bot_anchor",
+                message="不能把 Bot 自己的消息当作参与锚点。",
+            )
+        evidence = [str(item).strip() for item in evidence_message_ids]
+        external = set(self._valid_evidence_locked(state, umo, evidence))
+        if any(
+            not item
+            or item not in external
+            or (valid_ids is not None and item not in valid_ids)
+            or (bot_ids is not None and item in bot_ids)
+            for item in evidence
+        ):
+            return ControlResult(
+                ok=False,
+                code="invalid_evidence",
+                message="证据必须来自本会话实际评估的外部消息。",
+            )
+        if anchor not in evidence:
+            evidence.insert(0, anchor)
+        evidence = self._merge_evidence([], evidence)
+        interest = None
+        if interest_id:
+            interest = (state.get("interests") or {}).get(interest_id)
+            if (
+                not isinstance(interest, dict)
+                or interest.get("umo") != umo
+                or interest.get("status") != "watching"
+                or interest.get("quarantine")
+                or int(interest.get("remaining_checks") or 0) <= 0
+                or parse_iso(interest.get("expires_at"), self.settings.tz) is None
+                or parse_iso(interest.get("expires_at"), self.settings.tz) <= moment
+            ):
+                return ControlResult(
+                    ok=False,
+                    code="interest_not_found",
+                    message="参与机会必须引用本会话中仍然有效的兴趣。",
+                )
+        elif kind != "direct_request":
+            return ControlResult(
+                ok=False,
+                code="interest_required",
+                message="自主参与机会必须引用一个已准入兴趣。",
+            )
+
+        for raw in (state.get("opportunities") or {}).values():
+            if not isinstance(raw, dict) or raw.get("umo") != umo:
+                continue
+            if raw.get("anchor_message_id") != anchor:
+                continue
+            if raw.get("status") in {"consumed", "uncertain", "expired"}:
+                return ControlResult(
+                    ok=False,
+                    code="opportunity_consumed",
+                    message="该锚点已经处理过，不能重复参与。",
+                    data={"opportunity": dict(raw)},
+                )
+            if raw.get("status") in {"pending", "reserved"}:
+                return ControlResult(
+                    ok=True,
+                    code="opportunity_existing",
+                    message="该锚点已有参与机会。",
+                    data={"opportunity": dict(raw)},
+                )
+
+        anchor_created = None
+        for item in (state.get("recent_messages") or {}).get(umo, []):
+            if isinstance(item, dict) and item.get("message_id") == anchor:
+                anchor_created = parse_iso(item.get("created_at"), self.settings.tz)
+                break
+        if anchor_created is None:
+            return ControlResult(
+                ok=False, code="invalid_anchor", message="锚点缺少可信消息时间。"
+            )
+        session = (state.get("sessions") or {}).get(umo, {})
+        if anchor_created.timestamp() <= float(session.get("handled_before_ts") or 0):
+            return ControlResult(
+                ok=False,
+                code="opportunity_consumed",
+                message="该锚点已被保守去重记录覆盖。",
+            )
+        if anchor_created > moment:
+            return ControlResult(
+                ok=False,
+                code="future_anchor",
+                message="锚点消息时间晚于当前时间，不能作为参与证据。",
+            )
+        expires_at = add_minutes(
+            anchor_created if anchor_created is not None else moment,
+            max(1, int(self.settings.opportunity_ttl_minutes)),
+        )
+        if expires_at <= moment:
+            return ControlResult(
+                ok=False,
+                code="opportunity_expired",
+                message="锚点消息已超过参与机会有效期。",
+            )
+        opportunity = Opportunity(
+            opportunity_id=_new_id("op"),
+            umo=umo,
+            interest_id=interest_id,
+            kind=kind,
+            anchor_message_id=anchor,
+            anchor_created_at=to_iso(anchor_created),
+            evidence_message_ids=evidence,
+            expected_contribution=expected_contribution,
+            status="pending",
+            expires_at=to_iso(expires_at),
+            created_at=to_iso(moment),
+            updated_at=to_iso(moment),
+            revision=1,
+        ).to_dict()
+        state.setdefault("opportunities", {})[opportunity["opportunity_id"]] = (
+            opportunity
+        )
+        return ControlResult(
+            ok=True,
+            code="opportunity_created",
+            message="参与机会已创建。",
+            data={"opportunity": dict(opportunity)},
+        )
+
+    def approve_participation_locked(
+        self,
+        state: dict[str, Any],
+        *,
+        umo: str,
+        wake_source: str,
+        suggested_action: str,
+        opportunity_payload: dict[str, Any] | None,
+        moment: datetime,
+        valid_ids: set[str] | None = None,
+        bot_ids: set[str] | None = None,
+        anchor_message_id: str = "",
+        interest_id: str = "",
+        interest_update: dict[str, Any] | None = None,
+        consume_on_approval: bool = False,
+    ) -> ParticipationApproval:
+        """Unified admission for passive and active autonomous participation.
+
+        Explicit wake sources pass directly without consuming an autonomous
+        quota. Autonomous paths must present a valid, unconsumed anchor and
+        pass the session/global quota checks in the same critical section.
+        """
+
+        explicit = wake_source in EXPLICIT_WAKE_SOURCES
+        action = str(suggested_action or "").strip().lower()
+        if explicit:
+            if action not in {"reply", "pass"}:
+                return ParticipationApproval(
+                    approved=False,
+                    code="explicit_action",
+                    message="显式请求走直接放行，不需要兴趣模型批准。",
+                    wake_source=wake_source,
+                )
+            anchor = str(anchor_message_id or "").strip() or str(
+                (opportunity_payload or {}).get("anchor_message_id") or ""
+            )
+            if not anchor:
+                anchor = f"explicit_{uuid.uuid4().hex[:12]}"
+            existing = next(
+                (
+                    raw
+                    for raw in (state.get("opportunities") or {}).values()
+                    if isinstance(raw, dict)
+                    and raw.get("umo") == umo
+                    and raw.get("anchor_message_id") == anchor
+                    and raw.get("status")
+                    in {"pending", "reserved", "consumed", "uncertain"}
+                ),
+                None,
+            )
+            if existing is not None:
+                if existing.get("status") in {"consumed", "uncertain"}:
+                    return ParticipationApproval(
+                        approved=False,
+                        code="duplicate_event",
+                        message="该锚点已经处理。",
+                    )
+                existing["status"] = "consumed"
+                existing["outcome"] = "explicit_pass"
+                existing["consumed_at"] = to_iso(moment)
+                existing["updated_at"] = to_iso(moment)
+                existing["revision"] = int(existing.get("revision") or 1) + 1
+                return ParticipationApproval(
+                    approved=True,
+                    code="explicit_pass",
+                    message="显式请求允许直接响应。",
+                    opportunity=dict(existing),
+                    reservation_id=str(existing.get("reservation_id") or ""),
+                    interest_id=interest_id,
+                    wake_source=wake_source,
+                    direct_request=True,
+                )
+            opportunity = {
+                "opportunity_id": _new_id("op"),
+                "umo": umo,
+                "interest_id": interest_id,
+                "kind": "direct_request",
+                "anchor_message_id": anchor,
+                "anchor_created_at": next(
+                    (
+                        str(item.get("created_at") or to_iso(moment))
+                        for item in (state.get("recent_messages") or {}).get(umo, [])
+                        if isinstance(item, dict) and item.get("message_id") == anchor
+                    ),
+                    to_iso(moment),
+                ),
+                "evidence_message_ids": self._merge_evidence([], [anchor]),
+                "expected_contribution": "explicit user request",
+                "status": "consumed",
+                "expires_at": to_iso(
+                    add_minutes(
+                        moment,
+                        max(1, int(self.settings.opportunity_ttl_minutes)),
+                    )
+                ),
+                "reservation_id": _new_id("rsv"),
+                "reserved_at": to_iso(moment),
+                "consumed_at": to_iso(moment),
+                "outcome": "explicit_pass",
+                "created_at": to_iso(moment),
+                "updated_at": to_iso(moment),
+                "revision": 1,
+            }
+            state.setdefault("opportunities", {})[opportunity["opportunity_id"]] = (
+                opportunity
+            )
+            return ParticipationApproval(
+                approved=True,
+                code="explicit_pass",
+                message="显式请求允许直接响应。",
+                opportunity=opportunity,
+                reservation_id=opportunity["reservation_id"],
+                interest_id=interest_id,
+                wake_source=wake_source,
+                direct_request=True,
+            )
+
+        if action not in {"reply", "participate"}:
+            return ParticipationApproval(
+                approved=False,
+                code="autonomous_action",
+                message="自主路径只有 reply/participate 才需要参与许可。",
+                wake_source=wake_source,
+            )
+        payload = opportunity_payload if isinstance(opportunity_payload, dict) else {}
+        result = self.create_opportunity_locked(
+            state,
+            umo=umo,
+            interest_id=str(payload.get("interest_id") or interest_id or ""),
+            kind=str(payload.get("kind") or "natural_opening"),
+            anchor_message_id=str(
+                payload.get("anchor_message_id") or anchor_message_id or ""
+            ),
+            evidence_message_ids=list(payload.get("evidence_message_ids") or []),
+            expected_contribution=str(payload.get("expected_contribution") or ""),
+            moment=moment,
+            valid_ids=valid_ids,
+            bot_ids=bot_ids,
+        )
+        if not result.ok:
+            return ParticipationApproval(
+                approved=False,
+                code=result.code,
+                message=result.message,
+                wake_source=wake_source,
+            )
+        opportunity = dict(result.data.get("opportunity") or {})
+        if opportunity.get("status") == "reserved":
+            return ParticipationApproval(
+                approved=False,
+                code="opportunity_pending",
+                message="该参与机会已被其他路径预留。",
+                opportunity=opportunity,
+                wake_source=wake_source,
+            )
+        if opportunity.get("status") == "consumed":
+            return ParticipationApproval(
+                approved=False,
+                code="opportunity_consumed",
+                message="该参与机会已经被消费。",
+                opportunity=opportunity,
+                wake_source=wake_source,
+            )
+        allowed, reason = self.policy.can_reserve_autonomous(state, umo, moment)
+        if not allowed:
+            pending = state.get("opportunities", {}).get(
+                opportunity.get("opportunity_id")
+            )
+            if isinstance(pending, dict) and pending.get("status") == "pending":
+                pending["status"] = "expired"
+                pending["outcome"] = reason
+                pending["updated_at"] = to_iso(moment)
+                pending["revision"] = int(pending.get("revision") or 1) + 1
+            return ParticipationApproval(
+                approved=False,
+                code=reason,
+                message="本会话或全局自主参与额度不足。",
+                opportunity=opportunity,
+                wake_source=wake_source,
+            )
+        reservation_id = _new_id("rsv")
+        opportunity["status"] = "reserved"
+        opportunity["reservation_id"] = reservation_id
+        opportunity["reserved_at"] = to_iso(moment)
+        opportunity["updated_at"] = to_iso(moment)
+        opportunity["revision"] = int(opportunity.get("revision") or 1) + 1
+        state["opportunities"][opportunity["opportunity_id"]] = opportunity
+        self.policy.reserve_autonomous(state, umo, moment)
+        session = self.policy.ensure_session(state, umo, moment)
+        if consume_on_approval:
+            opportunity["status"] = "consumed"
+            opportunity["outcome"] = "approved_pass"
+            opportunity["consumed_at"] = to_iso(moment)
+            opportunity["updated_at"] = to_iso(moment)
+            opportunity["revision"] = int(opportunity.get("revision") or 1) + 1
+            state["opportunities"][opportunity["opportunity_id"]] = opportunity
+            session["pending_reply_reservation"] = ""
+        else:
+            session["pending_reply_reservation"] = reservation_id
+        session["revision"] = int(session.get("revision") or 1) + 1
+        return ParticipationApproval(
+            approved=True,
+            code="autonomous_approved",
+            message="参与机会已预留并获批。",
+            opportunity=opportunity,
+            reservation_id=reservation_id,
+            interest_id=str(opportunity.get("interest_id") or ""),
+            wake_source=wake_source,
+            reason=str((interest_update or {}).get("summary") or ""),
+        )
+
+    def complete_participation_locked(
+        self,
+        state: dict[str, Any],
+        *,
+        umo: str,
+        reservation_id: str,
+        outcome: str,
+        moment: datetime | None = None,
+    ) -> None:
+        """Consume or mark uncertain one reserved participation."""
+
+        if not reservation_id:
+            return
+        moment = moment or self.now()
+        status = (
+            "uncertain"
+            if outcome in {"uncertain_delivery", "restart_uncertain"}
+            else "consumed"
+        )
+        for raw in (state.get("opportunities") or {}).values():
+            if not isinstance(raw, dict) or raw.get("umo") != umo:
+                continue
+            if raw.get("reservation_id") != reservation_id:
+                continue
+            raw["status"] = status
+            raw["outcome"] = outcome
+            if status == "consumed":
+                raw["consumed_at"] = to_iso(moment)
+            raw["updated_at"] = to_iso(moment)
+            raw["revision"] = int(raw.get("revision") or 1) + 1
+            break
+        session = self.policy.ensure_session(state, umo, moment)
+        if session.get("pending_reply_reservation") == reservation_id:
+            session["pending_reply_reservation"] = ""
+            session["revision"] = int(session.get("revision") or 1) + 1
+
+    # ------------------------------------------------------------------
+    # Directives (focus / stop / schedule)
     # ------------------------------------------------------------------
 
     def set_intent_locked(
@@ -387,6 +1717,7 @@ class AttentionControlService:
         reason: str = "",
         expires_in_minutes: int | None = None,
         minutes: int | None = None,
+        interest_id: str = "",
     ) -> ControlResult:
         intent_type = str(intent_type or "").strip().lower()
         if intent_type not in DIRECTIVE_TYPES:
@@ -394,6 +1725,10 @@ class AttentionControlService:
                 ok=False,
                 code="invalid_intent",
                 message=f"不支持的意图类型：{intent_type or '-'}",
+            )
+        if not actor.session:
+            return ControlResult(
+                ok=False, code="missing_session", message="缺少可信会话标识。"
             )
         if not self._actor_can_write_source(actor, SOURCE_MAIN_AGENT):
             return ControlResult(
@@ -411,13 +1746,23 @@ class AttentionControlService:
                 code="group_not_allowed",
                 message="当前群不在 group_allowlist 中。",
             )
-
-        if intent_type == "focus_group" and not actor.is_admin:
-            return ControlResult(
-                ok=False,
-                code="permission_denied",
-                message="群级关注意图需要管理员权限；普通成员可以使用 focus_topic。",
-            )
+        if interest_id:
+            selected = (state.get("interests") or {}).get(interest_id)
+            if not isinstance(selected, dict) or selected.get("umo") != actor.session:
+                return ControlResult(
+                    ok=False,
+                    code="scope_mismatch",
+                    message="Interest belongs to another session.",
+                )
+        if intent_type == "focus_topic" and target in (state.get("interests") or {}):
+            selected = state["interests"][target]
+            if not isinstance(selected, dict) or selected.get("umo") != actor.session:
+                return ControlResult(
+                    ok=False,
+                    code="scope_mismatch",
+                    message="Interest belongs to another session.",
+                )
+            interest_id, target = target, str(selected.get("summary") or "")
         if intent_type == "ignore_user":
             return self.ignore_user_locked(
                 state,
@@ -428,7 +1773,6 @@ class AttentionControlService:
             )
         if intent_type == "stop_focus":
             return self.stop_focus_locked(state, actor, target=target)
-
         if intent_type == "schedule_check":
             return self._schedule_check_locked(
                 state,
@@ -436,29 +1780,53 @@ class AttentionControlService:
                 target=target,
                 reason=reason,
                 minutes=minutes if minutes is not None else expires_in_minutes,
+                interest_id=interest_id,
             )
-
-        normalized_target = self._normalize_target(
-            actor,
-            target,
-            intent_type=intent_type,
-        )
-        if isinstance(normalized_target, ControlResult):
-            return normalized_target
-        target_value = normalized_target
-        if intent_type == "focus_topic" and not target_value:
-            return ControlResult(
-                ok=False,
-                code="missing_target",
-                message="focus_topic 需要提供话题关键字或话题 ID。",
-            )
-
+        if intent_type == "focus_group":
+            if not actor.is_admin:
+                return ControlResult(
+                    ok=False,
+                    code="permission_denied",
+                    message="群级关注意图需要管理员权限；普通成员可以使用 focus_topic。",
+                )
+            target_value = actor.session
+        else:
+            target_value = _clip(target, 200)
+            if not target_value:
+                return ControlResult(
+                    ok=False,
+                    code="missing_target",
+                    message="focus_topic 需要提供话题关键字。",
+                )
         expires_at = self._resolve_expiry(
             actor,
             max_hours=self.settings.main_agent_max_intent_hours,
             requested_minutes=expires_in_minutes,
             allow_permanent=False,
+            default_minutes=self.settings.interest_ttl_minutes,
         )
+        if expires_at is None:
+            expires_at = add_minutes(
+                self.now(), max(1, int(self.settings.interest_ttl_minutes))
+            )
+        interest = None
+        if intent_type == "focus_topic":
+            interest_result = self.admit_interest_locked(
+                state,
+                actor,
+                summary=target_value,
+                wait_for="Wait for relevant external progress",
+                evidence_message_ids=self._latest_external_ids_locked(
+                    state, actor.session, limit=3
+                ),
+                source=SOURCE_MAIN_AGENT,
+                expires_in_minutes=expires_in_minutes,
+                interest_id=interest_id,
+                priority_level=2,
+            )
+            if not interest_result.ok:
+                return interest_result
+            interest = interest_result.data["interest"]
         directive = self._upsert_directive_locked(
             state,
             actor,
@@ -467,12 +1835,251 @@ class AttentionControlService:
             reason=reason or intent_type,
             expires_at=expires_at,
         )
+        data: dict[str, Any] = {"directive": directive, "umo": actor.session}
+        if interest is not None:
+            data["interest"] = interest
+            directive["interest_id"] = interest["interest_id"]
+            state["interests"][interest["interest_id"]]["directive_id"] = directive[
+                "directive_id"
+            ]
+            if actor.group_id:
+                self.create_checkpoint_locked(
+                    state,
+                    actor,
+                    umo=actor.session,
+                    platform_id=actor.platform_id,
+                    group_id=actor.group_id,
+                    kind="interest",
+                    interest_id=interest["interest_id"],
+                    source=SOURCE_MAIN_AGENT,
+                    directive_id=directive["directive_id"],
+                    reason=reason or "focus_topic",
+                )
         return ControlResult(
             ok=True,
             code="intent_saved",
             message="主 Agent 意图已保存。",
-            data={"directive": directive},
+            data=data,
         )
+
+    def _schedule_check_locked(
+        self,
+        state: dict[str, Any],
+        actor: Actor,
+        *,
+        target: str = "",
+        reason: str = "",
+        minutes: int | None = None,
+        interest_id: str = "",
+    ) -> ControlResult:
+        if not actor.group_id:
+            return ControlResult(
+                ok=False,
+                code="missing_group",
+                message="schedule_check 需要在群聊中调用。",
+            )
+        interest = (state.get("interests") or {}).get(interest_id)
+        if interest_id and (
+            not isinstance(interest, dict) or interest.get("umo") != actor.session
+        ):
+            return ControlResult(
+                ok=False,
+                code="interest_not_found",
+                message="当前会话不存在该兴趣。",
+            )
+        kind = "interest" if isinstance(interest, dict) else "session_scan"
+        expires_at = self._resolve_expiry(
+            actor,
+            max_hours=self.settings.main_agent_max_intent_hours,
+            requested_minutes=expires_in_minutes_from_minutes(minutes),
+            allow_permanent=False,
+            default_minutes=self.settings.interest_ttl_minutes,
+        )
+        directive = self._upsert_directive_locked(
+            state,
+            actor,
+            directive_type="schedule_check",
+            target=actor.session,
+            reason=reason or "main agent schedule_check",
+            expires_at=expires_at,
+        )
+        result = self.create_checkpoint_locked(
+            state,
+            actor,
+            umo=actor.session,
+            platform_id=actor.platform_id,
+            group_id=actor.group_id,
+            kind=kind,
+            minutes=minutes,
+            reason=reason or "main agent schedule_check",
+            source=SOURCE_MAIN_AGENT,
+            interest_id=interest_id if kind == "interest" else "",
+            directive_id=str(directive.get("directive_id") or ""),
+        )
+        if not result.ok:
+            directive["status"] = "revoked"
+            directive["updated_at"] = to_iso(self.now())
+            directive["revision"] = int(directive.get("revision") or 1) + 1
+            return result
+        result.data["directive"] = directive
+        return result
+
+    def stop_focus_locked(
+        self,
+        state: dict[str, Any],
+        actor: Actor,
+        *,
+        target: str = "",
+        moment: datetime | None = None,
+    ) -> ControlResult:
+        if not self._actor_can_write_source(actor, SOURCE_MAIN_AGENT):
+            return ControlResult(
+                ok=False,
+                code="permission_denied",
+                message="当前操作者不能停止关注目标。",
+            )
+        moment = moment or self.now()
+        target_value = str(target or "").strip()
+        if target_value in {"*", "all"} and not actor.is_admin:
+            return ControlResult(
+                ok=False,
+                code="permission_denied",
+                message="只有管理员可以停止全部会话的关注。",
+            )
+        for resources in (state.get("interests") or {}, state.get("checkpoints") or {}):
+            resource = resources.get(target_value)
+            if isinstance(resource, dict) and resource.get("umo") != actor.session:
+                return ControlResult(
+                    ok=False,
+                    code="scope_mismatch",
+                    message="Target belongs to another session.",
+                )
+        umos = (
+            list(state.get("sessions") or {})
+            if target_value in {"*", "all"} and actor.is_admin
+            else [actor.session]
+        )
+        specific = target_value not in {"", "*", "all", actor.session, actor.group_id}
+        selected = {
+            str(item.get("interest_id") or "")
+            for item in (state.get("interests") or {}).values()
+            if isinstance(item, dict)
+            and item.get("umo") in umos
+            and (
+                not specific
+                or target_value == item.get("interest_id")
+                or target_value.casefold() in str(item.get("summary") or "").casefold()
+            )
+            and (actor.is_admin or item.get("source") != SOURCE_ADMIN)
+        }
+        revoked: list[str] = []
+        cancelled: list[str] = []
+        closed: list[str] = []
+        for interest_id in selected:
+            interest = state["interests"][interest_id]
+            if interest.get("status") == "closed":
+                continue
+            result = self.close_interest_locked(
+                state,
+                Actor(
+                    source=actor.source,
+                    session=str(interest.get("umo") or ""),
+                    is_admin=actor.is_admin,
+                ),
+                interest_id=interest_id,
+                reason="stop_focus",
+                moment=moment,
+            )
+            if result.ok:
+                closed.append(interest_id)
+                cancelled.extend(result.data.get("cancelled_checkpoints") or [])
+        for directive in (state.get("directives") or {}).values():
+            if not isinstance(directive, dict) or directive.get("status") != "active":
+                continue
+            if directive.get("created_by_session") not in umos:
+                continue
+            if not actor.is_admin and directive.get("source") == SOURCE_ADMIN:
+                continue
+            if directive.get("type") not in {
+                "focus_group",
+                "focus_topic",
+                "schedule_check",
+            }:
+                continue
+            if (
+                specific
+                and directive.get("interest_id") not in selected
+                and directive.get("target") != target_value
+            ):
+                continue
+            directive["status"] = "revoked"
+            directive["updated_at"] = to_iso(moment)
+            directive["revision"] = int(directive.get("revision") or 1) + 1
+            revoked.append(str(directive.get("directive_id") or ""))
+        for checkpoint in (state.get("checkpoints") or {}).values():
+            if not isinstance(checkpoint, dict) or checkpoint.get("umo") not in umos:
+                continue
+            if checkpoint.get("status") not in {"active", "paused", "running"}:
+                continue
+            if (
+                specific
+                and checkpoint.get("interest_id") not in selected
+                and checkpoint.get("checkpoint_id") != target_value
+            ):
+                continue
+            if not actor.is_admin and checkpoint.get("source") == SOURCE_ADMIN:
+                continue
+            checkpoint.update(
+                status="cancelled",
+                scheduled_at="",
+                run_id="",
+                last_result="stop_focus",
+                updated_at=to_iso(moment),
+                revision=int(checkpoint.get("revision") or 1) + 1,
+            )
+            cancelled.append(str(checkpoint.get("checkpoint_id") or ""))
+        if not specific:
+            for umo in umos:
+                self._upsert_directive_locked(
+                    state,
+                    Actor(source=actor.source, session=umo, is_admin=actor.is_admin),
+                    directive_type="stop_focus",
+                    target=umo,
+                    reason="explicit stop_focus",
+                    expires_at=add_minutes(
+                        moment, self.settings.main_agent_max_intent_hours * 60
+                    ),
+                )
+        if not actor.is_admin:
+            self._record_decision_locked(
+                state,
+                umo=actor.session,
+                kind="control",
+                trigger=actor.source,
+                code_decision="focus_stopped",
+                reason=f"revoked={len(revoked)} closed={len(closed)} "
+                f"cancelled={len(cancelled)}",
+            )
+        return ControlResult(
+            ok=True,
+            code="focus_stopped"
+            if (revoked or closed or cancelled)
+            else "nothing_to_stop",
+            message=(
+                "已停止当前会话中由主 Agent 发起的关注。"
+                if (revoked or closed or cancelled)
+                else "当前会话没有可停止的主 Agent 意图。"
+            ),
+            data={
+                "revoked_directives": revoked,
+                "closed_interests": closed,
+                "cancelled_checkpoints": cancelled,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Policy writes (also used by engine / admin commands)
+    # ------------------------------------------------------------------
 
     def ignore_user_locked(
         self,
@@ -522,12 +2129,12 @@ class AttentionControlService:
                 code="group_not_allowed",
                 message="当前群不在 group_allowlist 中。",
             )
-
         expires_at = self._resolve_expiry(
             actor,
             max_hours=self.settings.main_agent_max_policy_hours,
             requested_minutes=expires_in_minutes,
             allow_permanent=actor.is_admin,
+            default_minutes=self.settings.main_agent_max_policy_hours * 60,
         )
         policy_result = self.set_policy_locked(
             state,
@@ -560,10 +2167,7 @@ class AttentionControlService:
             ok=True,
             code="user_ignored",
             message="用户忽略策略已生效，从后续消息开始生效。",
-            data={
-                "policy": policy_result.data,
-                "directive": directive,
-            },
+            data={"policy": policy_result.data, "directive": directive},
         )
 
     def clear_user_policy_locked(
@@ -635,231 +2239,6 @@ class AttentionControlService:
             data={"policy_id": policy.get("policy_id", "")},
         )
 
-    def stop_focus_locked(
-        self,
-        state: dict[str, Any],
-        actor: Actor,
-        *,
-        target: str = "",
-    ) -> ControlResult:
-        if not self._actor_can_write_source(actor, SOURCE_MAIN_AGENT):
-            return ControlResult(
-                ok=False,
-                code="permission_denied",
-                message="当前操作者不能停止关注目标。",
-            )
-        if actor.group_id and not self.policy.group_allowed(
-            actor.group_id,
-            actor.session,
-            actor.platform_id,
-        ):
-            return ControlResult(
-                ok=False,
-                code="group_not_allowed",
-                message="当前群不在 group_allowlist 中。",
-            )
-        target_value = self._normalize_target(
-            actor,
-            target,
-            intent_type="focus_group",
-            allow_all=True,
-        )
-        if isinstance(target_value, ControlResult):
-            return target_value
-        moment = self.now()
-        revoked: list[str] = []
-        cancelled: list[str] = []
-        for raw in state.get("directives", {}).values():
-            if not isinstance(raw, dict) or raw.get("status") != "active":
-                continue
-            if raw.get("source") != SOURCE_MAIN_AGENT:
-                continue
-            if raw.get("type") not in {"focus_group", "focus_topic", "schedule_check"}:
-                continue
-            if actor.is_admin:
-                if not self._directive_matches(raw, target_value, actor):
-                    continue
-            elif raw.get("created_by_session") != actor.session:
-                continue
-            raw["status"] = "revoked"
-            raw["updated_at"] = to_iso(moment)
-            raw["revision"] = int(raw.get("revision") or 1) + 1
-            revoked.append(str(raw.get("directive_id") or ""))
-        for checkpoint in state.get("checkpoints", {}).values():
-            if not isinstance(checkpoint, dict):
-                continue
-            if checkpoint.get("status") not in {"active", "paused"}:
-                continue
-            source = str(checkpoint.get("source") or "")
-            if actor.is_admin:
-                if target_value not in {"*", "all"}:
-                    target_group, target_umo, _ = self._resolve_target_group(
-                        actor,
-                        target_value,
-                    )
-                    if not (
-                        checkpoint.get("umo") == target_value
-                        or checkpoint.get("umo") == target_umo
-                        or checkpoint.get("group_id") == target_group
-                    ):
-                        continue
-            else:
-                # Ordinary members may only stop the main-agent intents they
-                # created in this session. Attention-agent checkpoints and
-                # admin checkpoints are protected.
-                if source != SOURCE_MAIN_AGENT:
-                    continue
-                if checkpoint.get("created_by_session") != actor.session:
-                    continue
-            checkpoint["status"] = "cancelled"
-            checkpoint["scheduled_at"] = ""
-            checkpoint["last_result"] = "main_agent_stop_focus"
-            checkpoint["updated_at"] = to_iso(moment)
-            checkpoint["revision"] = int(checkpoint.get("revision") or 1) + 1
-            cancelled.append(str(checkpoint.get("checkpoint_id") or ""))
-
-        if not actor.is_admin:
-            self._record_control_decision_locked(
-                state,
-                actor,
-                decision="focus_stopped",
-                reason=f"revoked={len(revoked)} cancelled={len(cancelled)}",
-            )
-            return ControlResult(
-                ok=True,
-                code="nothing_to_stop"
-                if not revoked and not cancelled
-                else "focus_stopped",
-                message=(
-                    "当前会话没有可停止的主 Agent 意图。"
-                    if not revoked and not cancelled
-                    else "已停止当前会话中由主 Agent 发起的关注/检查意图。"
-                ),
-                data={
-                    "revoked_directives": revoked,
-                    "cancelled_checkpoints": cancelled,
-                },
-            )
-
-        expires_at = self._resolve_expiry(
-            actor,
-            max_hours=self.settings.main_agent_max_intent_hours,
-            requested_minutes=None,
-            allow_permanent=False,
-        )
-        directive = self._upsert_directive_locked(
-            state,
-            actor,
-            directive_type="stop_focus",
-            target=target_value,
-            reason="main agent stop_focus",
-            expires_at=expires_at,
-        )
-        self._record_control_decision_locked(
-            state,
-            actor,
-            decision="focus_stopped",
-            reason=f"revoked={len(revoked)} cancelled={len(cancelled)}",
-            related_directive_id=str(directive.get("directive_id") or ""),
-        )
-        return ControlResult(
-            ok=True,
-            code="focus_stopped",
-            message="关注目标已停止。",
-            data={
-                "directive": directive,
-                "revoked_directives": revoked,
-                "cancelled_checkpoints": cancelled,
-            },
-        )
-
-    def _schedule_check_locked(
-        self,
-        state: dict[str, Any],
-        actor: Actor,
-        *,
-        target: str = "",
-        reason: str = "",
-        minutes: int | None = None,
-    ) -> ControlResult:
-        if not actor.group_id:
-            return ControlResult(
-                ok=False,
-                code="missing_group",
-                message="schedule_check 需要在群聊中调用。",
-            )
-        target_value = self._normalize_target(
-            actor,
-            target,
-            intent_type="focus_group",
-        )
-        if isinstance(target_value, ControlResult):
-            return target_value
-        group_id, umo, platform_id = self._resolve_target_group(
-            actor,
-            target_value,
-        )
-        if not group_id or not self.policy.group_allowed(
-            group_id,
-            umo,
-            platform_id,
-        ):
-            return ControlResult(
-                ok=False,
-                code="group_not_allowed",
-                message="目标群不在 group_allowlist 中。",
-            )
-        delay = int(minutes or self.settings.default_interval_minutes)
-        max_delay = min(
-            self.settings.max_interval_minutes,
-            self.settings.max_defer_minutes,
-        )
-        if not actor.is_admin:
-            max_delay = min(
-                max_delay,
-                self.settings.main_agent_max_intent_hours * 60,
-            )
-        delay = max(self.settings.min_interval_minutes, min(max_delay, delay))
-        desired = self._shift_out_of_quiet(add_minutes(self.now(), delay))
-        expires_at = add_minutes(desired, 60)
-        directive = self._upsert_directive_locked(
-            state,
-            actor,
-            directive_type="schedule_check",
-            target=target_value,
-            reason=reason or "main agent schedule_check",
-            expires_at=expires_at,
-        )
-        checkpoint = self._create_checkpoint_locked(
-            state,
-            actor,
-            umo=umo,
-            platform_id=platform_id,
-            group_id=group_id,
-            scheduled_at=desired,
-            reason=reason or "main agent schedule_check",
-            source=SOURCE_MAIN_AGENT,
-            directive_id=str(directive.get("directive_id") or ""),
-        )
-        if not checkpoint.ok:
-            directive["status"] = "revoked"
-            directive["updated_at"] = to_iso(self.now())
-            directive["revision"] = int(directive.get("revision") or 1) + 1
-            return checkpoint
-        return ControlResult(
-            ok=True,
-            code="check_scheduled",
-            message="检查点已按主 Agent 意图安排。",
-            data={
-                "directive": directive,
-                "checkpoint": checkpoint.data,
-            },
-        )
-
-    # ------------------------------------------------------------------
-    # Policy writes (also used by engine / admin commands)
-    # ------------------------------------------------------------------
-
     def set_policy_locked(
         self,
         state: dict[str, Any],
@@ -906,13 +2285,6 @@ class AttentionControlService:
                 code="permission_denied",
                 message="只有管理员可以写入全局用户策略。",
             )
-        if not actor.is_admin and scope == "group" and source != SOURCE_ATTENTION_AGENT:
-            return ControlResult(
-                ok=False,
-                code="permission_denied",
-                message="只有管理员可以写入群级策略。",
-            )
-
         moment = self.now()
         expires_at = self._clamp_policy_expiry(
             actor,
@@ -975,10 +2347,12 @@ class AttentionControlService:
             }
         )
         state.setdefault("policies", {})[policy_id] = raw
-        self._record_control_decision_locked(
+        self._record_decision_locked(
             state,
-            actor,
-            decision="policy_saved",
+            umo=actor.session,
+            kind="control",
+            trigger=actor.source,
+            code_decision="policy_saved",
             reason=reason,
             related_policy_id=policy_id,
             related_directive_id=directive_id,
@@ -1031,10 +2405,12 @@ class AttentionControlService:
                         message="只能撤销当前会话创建的主 Agent 策略。",
                     )
         state.setdefault("policies", {}).pop(policy_id, None)
-        self._record_control_decision_locked(
+        self._record_decision_locked(
             state,
-            actor,
-            decision="policy_removed",
+            umo=actor.session,
+            kind="control",
+            trigger=actor.source,
+            code_decision="policy_removed",
             reason=str(policy.get("reason") or "policy removed"),
             related_policy_id=policy_id,
         )
@@ -1046,211 +2422,187 @@ class AttentionControlService:
         )
 
     # ------------------------------------------------------------------
-    # Checkpoint writes (strategic)
+    # Expiry helpers
     # ------------------------------------------------------------------
 
-    def register_checkpoint_locked(
+    def expire_interests_locked(
         self,
         state: dict[str, Any],
-        checkpoint: dict[str, Any],
-        *,
-        actor: Actor,
-        source: str,
-        priority: int | None = None,
-        directive_id: str = "",
-    ) -> ControlResult:
-        if not self._actor_can_write_source(actor, source):
-            return ControlResult(
-                ok=False,
-                code="permission_denied",
-                message="当前操作者不能创建该来源的检查点。",
-            )
-        checkpoint = dict(checkpoint)
-        checkpoint["source"] = source
-        checkpoint["priority"] = int(priority or _priority(source))
-        checkpoint["directive_id"] = directive_id
-        checkpoint["created_by_session"] = actor.session
-        checkpoint.setdefault("created_by", source)
-        checkpoint.setdefault("revision", 1)
-        checkpoint.setdefault("created_at", to_iso(self.now()))
-        checkpoint.setdefault("updated_at", to_iso(self.now()))
-        state.setdefault("checkpoints", {})[
-            str(checkpoint.get("checkpoint_id") or "")
-        ] = checkpoint
-        self._record_control_decision_locked(
-            state,
-            actor,
-            decision="checkpoint_saved",
-            reason=str(checkpoint.get("reason") or "checkpoint saved"),
-            related_directive_id=directive_id,
-            checkpoint_id=str(checkpoint.get("checkpoint_id") or ""),
-        )
-        return ControlResult(
-            ok=True,
-            code="checkpoint_saved",
-            message="检查点已创建。",
-            data=checkpoint,
-        )
-
-    def finalize_checkpoint_locked(
-        self,
-        state: dict[str, Any],
-        checkpoint_id: str,
-        *,
-        status: str,
-        scheduled_at: str,
-        last_result: str,
-        last_error: str,
-        moment: datetime,
-    ) -> ControlResult:
-        """Write the operational result of one active checkpoint run."""
-
-        raw = (state.get("checkpoints") or {}).get(checkpoint_id)
-        if not isinstance(raw, dict):
-            return ControlResult(
-                ok=False,
-                code="checkpoint_not_found",
-                message="检查点不存在。",
-            )
-        raw["status"] = status
-        raw["scheduled_at"] = scheduled_at if status == "active" else ""
-        raw["last_result"] = last_result
-        raw["last_error"] = _clip(last_error, 300)
-        raw["run_id"] = ""
-        raw["updated_at"] = to_iso(moment)
-        raw["revision"] = int(raw.get("revision") or 1) + 1
-        return ControlResult(
-            ok=True,
-            code="checkpoint_finalized",
-            message="检查点结果已保存。",
-            data=dict(raw),
-        )
-
-    def set_checkpoint_status_locked(
-        self,
-        state: dict[str, Any],
-        actor: Actor,
-        checkpoint_id: str,
-        status: str,
-        *,
         moment: datetime | None = None,
-        scheduled_at: str | None = None,
-    ) -> ControlResult:
-        raw = (state.get("checkpoints") or {}).get(checkpoint_id)
-        if not isinstance(raw, dict):
-            return ControlResult(
-                ok=False,
-                code="checkpoint_not_found",
-                message="检查点不存在。",
-            )
-        source = str(raw.get("source") or SOURCE_ATTENTION_AGENT)
-        if not actor.is_admin and actor.source != SOURCE_SYSTEM:
-            if source == SOURCE_ADMIN:
-                return ControlResult(
-                    ok=False,
-                    code="admin_checkpoint_protected",
-                    message="管理员创建的检查点不能被当前操作者修改。",
-                )
-            if (
-                actor.source == SOURCE_ATTENTION_AGENT
-                and source != SOURCE_ATTENTION_AGENT
-            ):
-                return ControlResult(
-                    ok=False,
-                    code="permission_denied",
-                    message="注意力 Agent 不能修改主 Agent 的检查点。",
-                )
-            if source == SOURCE_MAIN_AGENT and raw.get("created_by_session") not in {
-                "",
-                actor.session,
-            }:
-                return ControlResult(
-                    ok=False,
-                    code="permission_denied",
-                    message="只能修改当前会话创建的主 Agent 检查点。",
-                )
-        moment = moment or self.now()
-        raw["status"] = status
-        if status == "cancelled":
-            raw["scheduled_at"] = ""
-        elif scheduled_at is not None:
-            raw["scheduled_at"] = scheduled_at
-        raw["updated_at"] = to_iso(moment)
-        raw["revision"] = int(raw.get("revision") or 1) + 1
-        return ControlResult(
-            ok=True,
-            code="checkpoint_updated",
-            message="检查点状态已更新。",
-            data=dict(raw),
-        )
+    ) -> int:
+        """Close interests whose TTL elapsed and expire their resources."""
 
-    def _create_checkpoint_locked(
+        moment = moment or self.now()
+        expired = 0
+        for raw in (state.get("interests") or {}).values():
+            if not isinstance(raw, dict):
+                continue
+            if raw.get("status") == "closed":
+                continue
+            expires_at = parse_iso(raw.get("expires_at"), self.settings.tz)
+            if expires_at is not None and expires_at <= moment:
+                raw["status"] = "closed"
+                raw["updated_at"] = to_iso(moment)
+                raw["revision"] = int(raw.get("revision") or 1) + 1
+                raw["close_reason"] = "expired"
+                expired += 1
+                for checkpoint in (state.get("checkpoints") or {}).values():
+                    if (
+                        isinstance(checkpoint, dict)
+                        and checkpoint.get("umo") == raw.get("umo")
+                        and checkpoint.get("interest_id") == raw.get("interest_id")
+                        and checkpoint.get("status") in {"active", "paused", "running"}
+                    ):
+                        checkpoint["status"] = "cancelled"
+                        checkpoint["scheduled_at"] = ""
+                        checkpoint["last_result"] = "interest_expired"
+                        checkpoint["updated_at"] = to_iso(moment)
+                for opportunity in (state.get("opportunities") or {}).values():
+                    if (
+                        isinstance(opportunity, dict)
+                        and opportunity.get("umo") == raw.get("umo")
+                        and opportunity.get("interest_id") == raw.get("interest_id")
+                        and opportunity.get("status") == "pending"
+                    ):
+                        opportunity["status"] = "expired"
+                        opportunity["outcome"] = "interest_expired"
+                        opportunity["updated_at"] = to_iso(moment)
+        for checkpoint in (state.get("checkpoints") or {}).values():
+            if (
+                isinstance(checkpoint, dict)
+                and checkpoint.get("kind") == "session_scan"
+                and checkpoint.get("status") in {"active", "running", "paused"}
+                and not checkpoint.get("quarantine")
+            ):
+                deadline = parse_iso(checkpoint.get("expires_at"), self.settings.tz)
+                if deadline is None or deadline <= moment:
+                    checkpoint.update(
+                        status="cancelled",
+                        scheduled_at="",
+                        run_id="",
+                        last_result="checkpoint_expired",
+                        updated_at=to_iso(moment),
+                    )
+        for opportunity in (state.get("opportunities") or {}).values():
+            if not isinstance(opportunity, dict):
+                continue
+            if opportunity.get("status") not in {"pending", "reserved"}:
+                continue
+            expires_at = parse_iso(opportunity.get("expires_at"), self.settings.tz)
+            if expires_at is not None and expires_at <= moment:
+                opportunity["status"] = (
+                    "uncertain"
+                    if opportunity.get("status") == "reserved"
+                    else "expired"
+                )
+                opportunity["outcome"] = (
+                    "reservation_expired"
+                    if opportunity.get("status") == "uncertain"
+                    else "ttl"
+                )
+                opportunity["updated_at"] = to_iso(moment)
+                opportunity["revision"] = int(opportunity.get("revision") or 1) + 1
+                session = (state.get("sessions") or {}).get(
+                    str(opportunity.get("umo") or ""), {}
+                )
+                if session.get("pending_reply_reservation") == opportunity.get(
+                    "reservation_id"
+                ):
+                    session["pending_reply_reservation"] = ""
+
+        return expired
+
+    def cleanup_locked(
         self,
         state: dict[str, Any],
-        actor: Actor,
+        moment: datetime | None = None,
         *,
-        umo: str,
-        platform_id: str,
-        group_id: str,
-        scheduled_at: datetime,
-        reason: str,
-        source: str,
-        directive_id: str = "",
-    ) -> ControlResult:
-        if not self.policy.group_allowed(group_id, umo, platform_id):
-            return ControlResult(
-                ok=False,
-                code="group_not_allowed",
-                message="目标群不在 group_allowlist 中。",
-            )
-        if directive_id:
-            for raw in state.get("checkpoints", {}).values():
-                if not isinstance(raw, dict):
-                    continue
-                if (
-                    raw.get("status") == "active"
-                    and raw.get("umo") == umo
-                    and raw.get("directive_id") == directive_id
-                ):
-                    raw["scheduled_at"] = to_iso(scheduled_at)
-                    raw["reason"] = _clip(reason, 200)
-                    raw["updated_at"] = to_iso(self.now())
-                    raw["revision"] = int(raw.get("revision") or 1) + 1
-                    return ControlResult(
-                        ok=True,
-                        code="checkpoint_saved",
-                        message="检查点已更新。",
-                        data=dict(raw),
-                    )
-        checkpoint_id = f"cp_{uuid.uuid4().hex[:12]}"
-        checkpoint = {
-            "checkpoint_id": checkpoint_id,
-            "umo": umo,
-            "platform_id": platform_id,
-            "group_id": group_id,
-            "scheduled_at": to_iso(scheduled_at),
-            "status": "active",
-            "reason": _clip(reason, 200),
-            "topic_id": f"topic_{hashlib.sha1(umo.encode()).hexdigest()[:12]}",
-            "last_result": "",
-            "last_error": "",
-            "run_id": "",
-            "attempts": 0,
-            "revision": 1,
-            "created_at": to_iso(self.now()),
-            "updated_at": to_iso(self.now()),
-        }
-        return self.register_checkpoint_locked(
-            state,
-            checkpoint,
-            actor=actor,
-            source=source,
-            directive_id=directive_id,
-        )
+        retention_days: int = 7,
+        max_terminal_opportunities: int = 500,
+    ) -> dict[str, int]:
+        """Remove old terminal resources while keeping recent dedupe tombstones.
 
-    # ------------------------------------------------------------------
-    # Directives and summaries
-    # ------------------------------------------------------------------
+        Args:
+            state: Mutable state dictionary.
+            moment: Current time, injectable for tests.
+            retention_days: Age after which closed/terminal records are removed.
+            max_terminal_opportunities: Maximum terminal opportunities to keep.
+
+        Returns:
+            Counts of removed interests, checkpoints and opportunities.
+        """
+
+        moment = moment or self.now()
+        cutoff = moment - timedelta(days=max(1, int(retention_days)))
+        removed = {"interests": 0, "checkpoints": 0, "opportunities": 0}
+
+        for key, raw in list((state.get("interests") or {}).items()):
+            if not isinstance(raw, dict) or raw.get("status") != "closed":
+                continue
+            updated = parse_iso(raw.get("updated_at"), self.settings.tz)
+            if updated is not None and updated <= cutoff:
+                state["interests"].pop(key, None)
+                removed["interests"] += 1
+
+        for key, raw in list((state.get("checkpoints") or {}).items()):
+            if not isinstance(raw, dict):
+                continue
+            if raw.get("status") in {"active", "running", "paused"}:
+                continue
+            updated = parse_iso(raw.get("updated_at"), self.settings.tz)
+            if updated is not None and updated <= cutoff:
+                state["checkpoints"].pop(key, None)
+                removed["checkpoints"] += 1
+
+        for container, terminal_statuses in (
+            ("interests", {"closed"}),
+            ("checkpoints", {"completed", "cancelled"}),
+        ):
+            terminal_records = sorted(
+                (
+                    item
+                    for item in state.get(container, {}).values()
+                    if isinstance(item, dict)
+                    and item.get("status") in terminal_statuses
+                    and not item.get("quarantine")
+                ),
+                key=lambda item: str(item.get("updated_at") or ""),
+            )
+            id_field = "interest_id" if container == "interests" else "checkpoint_id"
+            for item in terminal_records[:-500]:
+                if (
+                    state[container].pop(str(item.get(id_field) or ""), None)
+                    is not None
+                ):
+                    removed[container] += 1
+        terminal = [
+            raw
+            for raw in (state.get("opportunities") or {}).values()
+            if isinstance(raw, dict)
+            and raw.get("status") in {"consumed", "expired", "uncertain"}
+        ]
+        terminal.sort(key=lambda item: str(item.get("updated_at") or ""))
+        keep = max(50, int(max_terminal_opportunities))
+        removable = terminal[:-keep] if len(terminal) > keep else []
+        for raw in terminal:
+            updated = parse_iso(raw.get("updated_at"), self.settings.tz)
+            if raw in removable or (updated is not None and updated <= cutoff):
+                key = str(raw.get("opportunity_id") or "")
+                if state["opportunities"].pop(key, None) is not None:
+                    session = self.policy.ensure_session(
+                        state, str(raw.get("umo") or ""), moment
+                    )
+                    anchor_time = parse_iso(
+                        raw.get("anchor_created_at") or raw.get("created_at"),
+                        self.settings.tz,
+                    )
+                    if anchor_time is not None:
+                        session["handled_before_ts"] = max(
+                            float(session.get("handled_before_ts") or 0),
+                            anchor_time.timestamp(),
+                        )
+                    removed["opportunities"] += 1
+        return removed
 
     def expire_directives_locked(
         self,
@@ -1259,7 +2611,7 @@ class AttentionControlService:
     ) -> int:
         moment = moment or self.now()
         expired = 0
-        for raw in state.get("directives", {}).values():
+        for raw in (state.get("directives") or {}).values():
             if not isinstance(raw, dict) or raw.get("status") != "active":
                 continue
             expires_at = parse_iso(raw.get("expires_at"), self.settings.tz)
@@ -1270,66 +2622,38 @@ class AttentionControlService:
                 expired += 1
         return expired
 
-    def active_directives_locked(
-        self,
-        state: dict[str, Any],
-        *,
-        group_id: str = "",
-        umo: str = "",
-    ) -> list[dict[str, Any]]:
-        self.expire_directives_locked(state)
-        result: list[dict[str, Any]] = []
-        for raw in state.get("directives", {}).values():
-            if not isinstance(raw, dict) or raw.get("status") != "active":
-                continue
-            if raw.get("type") == "stop_focus":
-                if self._directive_matches_target(raw, group_id, umo, ""):
-                    result.append(dict(raw))
-                continue
-            if raw.get("type") in {"focus_group", "schedule_check"}:
-                if not group_id:
-                    continue
-                if self._directive_matches_target(raw, group_id, umo, ""):
-                    result.append(dict(raw))
-            elif raw.get("type") == "ignore_user":
-                if not umo or raw.get("created_by_session") == umo:
-                    result.append(dict(raw))
-            elif raw.get("type") == "focus_topic":
-                if not umo or raw.get("created_by_session") == umo:
-                    result.append(dict(raw))
-        result.sort(
-            key=lambda item: (
-                -int(item.get("priority") or 0),
-                str(item.get("updated_at") or ""),
-            )
-        )
-        return result
+    # ------------------------------------------------------------------
+    # Prompt helpers
+    # ------------------------------------------------------------------
 
     def focus_directive(
         self,
         state: dict[str, Any],
         *,
-        group_id: str,
         umo: str,
-        topic_id: str = "",
         message_text: str = "",
+        message_id: str = "",
     ) -> dict[str, Any] | None:
+        """Return the strongest focus directive owned by ``umo``."""
+
         self.expire_directives_locked(state)
-        candidates: list[dict[str, Any]] = []
         lowered = (message_text or "").casefold()
-        for raw in state.get("directives", {}).values():
+        candidates: list[dict[str, Any]] = []
+        for raw in (state.get("directives") or {}).values():
             if not isinstance(raw, dict) or raw.get("status") != "active":
                 continue
+            if raw.get("created_by_session") != umo:
+                continue
             dtype = raw.get("type")
-            if dtype == "focus_group" and self._directive_matches_target(
-                raw, group_id, umo, ""
-            ):
+            if dtype == "focus_group":
                 candidates.append(raw)
             elif dtype == "focus_topic":
                 target = str(raw.get("target") or "").strip()
                 if not target:
                     continue
-                if target == topic_id or target.casefold() in lowered:
+                if message_id and target == message_id:
+                    candidates.append(raw)
+                elif target.casefold() in lowered:
                     candidates.append(raw)
         if not candidates:
             return None
@@ -1339,59 +2663,43 @@ class AttentionControlService:
                 str(item.get("updated_at") or ""),
             )
         )
-        stop = self.stop_directive(
-            state,
-            group_id=group_id,
-            umo=umo,
-            topic_id=topic_id,
-        )
-        if stop is not None and int(stop.get("priority") or 0) >= int(
-            candidates[0].get("priority") or 0
-        ):
-            return None
         return dict(candidates[0])
 
     def stop_directive(
         self,
         state: dict[str, Any],
         *,
-        group_id: str,
         umo: str,
-        topic_id: str = "",
     ) -> dict[str, Any] | None:
         self.expire_directives_locked(state)
         candidates: list[dict[str, Any]] = []
-        for raw in state.get("directives", {}).values():
+        for raw in (state.get("directives") or {}).values():
             if not isinstance(raw, dict) or raw.get("status") != "active":
                 continue
             if raw.get("type") != "stop_focus":
                 continue
-            if self._directive_matches_target(raw, group_id, umo, topic_id):
-                candidates.append(raw)
+            if raw.get("created_by_session") != umo:
+                continue
+            candidates.append(raw)
         if not candidates:
             return None
-        candidates.sort(
-            key=lambda item: (
-                -int(item.get("priority") or 0),
-                str(item.get("updated_at") or ""),
-            )
-        )
+        candidates.sort(key=lambda item: -int(item.get("priority") or 0))
         return dict(candidates[0])
 
     def prompt_summary_locked(
         self,
         state: dict[str, Any],
         *,
-        group_id: str = "",
-        umo: str = "",
+        umo: str,
         user_id: str = "",
+        group_id: str = "",
         platform_id: str = "",
-        topic_id: str = "",
         message_text: str = "",
+        message_id: str = "",
     ) -> str:
-        """Return a compact directive/policy summary for the *interest* model."""
+        """Return a compact, session-scoped summary for the interest model."""
 
-        self.expire_directives_locked(state)
+        self.expire_interests_locked(state)
         lines: list[str] = []
         policy = self.policy.matching_policy(
             state,
@@ -1402,68 +2710,52 @@ class AttentionControlService:
         )
         if policy is not None:
             lines.append(
-                "有效忽略策略：来源 {source}，优先级 {priority}，到期 {expires}，原因：{reason}".format(
+                "有效忽略策略：来源 {source}，到期 {expires}，原因：{reason}".format(
                     source=policy.get("source") or "-",
-                    priority=policy.get("priority") or 0,
                     expires=policy.get("expires_at") or "永久",
                     reason=_clip(policy.get("reason"), 100),
                 )
             )
-        elif group_id:
-            high_priority = []
-            for raw in state.get("policies", {}).values():
-                if not isinstance(raw, dict) or raw.get("mode") != "ignore":
-                    continue
-                if raw.get("source") not in {SOURCE_ADMIN, SOURCE_MAIN_AGENT}:
-                    continue
-                if not (
-                    raw.get("scope") == "user"
-                    or self.policy.matches_groups(
-                        (str(raw.get("group_id") or ""),),
-                        group_id,
-                        umo,
-                        platform_id,
+        interests = self.session_interests_locked(state, umo)
+        if interests:
+            lines.append("本会话兴趣：")
+            for item in interests[:5]:
+                lines.append(
+                    "- {id} [{status}] {summary}；等待：{wait}；剩余检查 {checks}，"
+                    "无进展 {no_progress}".format(
+                        id=item.get("interest_id"),
+                        status=item.get("status"),
+                        summary=_clip(item.get("summary"), 120),
+                        wait=_clip(item.get("wait_for"), 80) or "（无）",
+                        checks=item.get("remaining_checks", 0),
+                        no_progress=item.get("no_progress_count", 0),
                     )
-                ):
-                    continue
-                high_priority.append(
-                    f"{raw.get('user_id') or raw.get('group_id')}({raw.get('source')})"
                 )
-            if high_priority:
-                lines.append("高优先级忽略策略：" + "、".join(high_priority[:8]))
         focus = self.focus_directive(
             state,
-            group_id=group_id,
             umo=umo,
-            topic_id=topic_id,
             message_text=message_text,
+            message_id=message_id,
         )
         if focus:
             lines.append(
-                "主 Agent 关注意图：{type} {target}，到期 {expires}，原因：{reason}".format(
+                "主 Agent 关注意图：{type} {target}，到期 {expires}".format(
                     type=focus.get("type"),
-                    target=focus.get("target"),
+                    target=_clip(focus.get("target"), 100),
                     expires=focus.get("expires_at") or "-",
-                    reason=_clip(focus.get("reason"), 100),
                 )
             )
-        stop = self.stop_directive(
-            state,
-            group_id=group_id,
-            umo=umo,
-            topic_id=topic_id,
-        )
+        stop = self.stop_directive(state, umo=umo)
         if stop:
-            lines.append(
-                "主 Agent 停止关注意图：{target}，到期 {expires}".format(
-                    target=stop.get("target"),
-                    expires=stop.get("expires_at") or "-",
-                )
-            )
+            lines.append("主 Agent 停止关注意图：管理员已要求停止关注。")
         if not lines:
-            return "当前没有主 Agent 意图或用户忽略策略。"
+            return "当前会话没有主 Agent 意图、兴趣或用户忽略策略。"
         lines.append("兴趣模型不得覆盖上述主 Agent 意图和管理员策略。")
-        return "\n".join(lines[:8])
+        return "\n".join(lines[:10])
+
+    # ------------------------------------------------------------------
+    # Directives internals
+    # ------------------------------------------------------------------
 
     def _upsert_directive_locked(
         self,
@@ -1482,25 +2774,20 @@ class AttentionControlService:
             else SOURCE_MAIN_AGENT
         )
         if directive_type != "stop_focus":
-            for raw in state.get("directives", {}).values():
+            for raw in (state.get("directives") or {}).values():
                 if not isinstance(raw, dict):
                     continue
                 if raw.get("status") != "active" or raw.get("type") != "stop_focus":
                     continue
+                if raw.get("created_by_session") != actor.session:
+                    continue
                 if raw.get("source") == SOURCE_ADMIN and not actor.is_admin:
                     continue
-                stop_target = str(raw.get("target") or "")
-                if stop_target in {"*", "all"} and not actor.is_admin:
-                    continue
-                if (
-                    stop_target == target
-                    or raw.get("created_by_session") == actor.session
-                ):
-                    raw["status"] = "revoked"
-                    raw["updated_at"] = to_iso(moment)
-                    raw["revision"] = int(raw.get("revision") or 1) + 1
+                raw["status"] = "revoked"
+                raw["updated_at"] = to_iso(moment)
+                raw["revision"] = int(raw.get("revision") or 1) + 1
         existing: dict[str, Any] | None = None
-        for raw in state.get("directives", {}).values():
+        for raw in (state.get("directives") or {}).values():
             if not isinstance(raw, dict) or raw.get("status") != "active":
                 continue
             if (
@@ -1521,149 +2808,129 @@ class AttentionControlService:
             {
                 "directive_id": directive_id,
                 "type": directive_type,
-                "target": target,
+                "target": _clip(target, 200),
                 "priority": _priority(source),
                 "reason": _clip(reason, 200),
                 "source": source,
                 "expires_at": to_iso(expires_at) if expires_at else "",
                 "status": "active",
                 "created_by_session": actor.session,
-                "created_at": (raw.get("created_at") or to_iso(moment)),
+                "created_at": raw.get("created_at") or to_iso(moment),
                 "updated_at": to_iso(moment),
                 "revision": int(raw.get("revision") or 0) + 1,
             }
         )
         state.setdefault("directives", {})[directive_id] = raw
-        self._record_control_decision_locked(
-            state,
-            actor,
-            decision="directive_saved",
-            reason=reason,
-            related_directive_id=directive_id,
-        )
         return raw
 
-    def _directive_matches(
-        self,
-        directive: dict[str, Any],
-        target: str,
-        actor: Actor,
-    ) -> bool:
-        if target in {"*", "all"}:
-            return True
-        directive_target = str(directive.get("target") or "")
-        if directive_target in {"*", "all"}:
-            return True
-        if directive_target == target:
-            return True
-        return self._directive_matches_target(
-            directive,
-            actor.group_id,
-            actor.session,
-            "",
-        )
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-    def _directive_matches_target(
+    def _owner_mismatch(
         self,
-        directive: dict[str, Any],
-        group_id: str,
         umo: str,
-        topic_id: str,
-    ) -> bool:
-        target = str(directive.get("target") or "")
-        if target in {"*", "all"}:
-            return True
-        if not target:
-            return False
-        if target == topic_id and topic_id:
-            return True
-        return self.policy.matches_groups(
-            (target,),
-            group_id,
-            umo,
-            "",
-        )
-
-    def _target_matches_group(
-        self,
-        raw: dict[str, Any],
+        platform_id: str,
         group_id: str,
-        umo: str,
     ) -> bool:
-        return self.policy.matches_groups(
-            (str(raw.get("group_id") or raw.get("umo") or ""),),
-            group_id,
-            umo,
-            str(raw.get("platform_id") or ""),
-        )
+        """Return whether routing metadata contradicts the UMO ownership key."""
 
-    def _current_topic_locked(
+        parts = str(umo or "").split(":", 2)
+        if len(parts) != 3 or not all(parts):
+            return True
+        platform, message_type, identifier = parts
+        if platform_id and platform != platform_id:
+            return True
+        # Isolated session identifiers are platform-defined and opaque. The
+        # trusted Actor/event supplies the real group route independently.
+        if message_type == "GroupMessage":
+            binding = (self.store.state.get("sessions") or {}).get(umo, {})
+            return bool(
+                binding.get("group_id") and group_id and binding["group_id"] != group_id
+            )
+        if message_type == "FriendMessage":
+            return bool(group_id)
+        return False
+
+    def _latest_external_ids_locked(
         self,
         state: dict[str, Any],
         umo: str,
-    ) -> dict[str, Any]:
-        topic_id = f"topic_{hashlib.sha1(umo.encode()).hexdigest()[:12]}"
-        raw = (state.get("topics") or {}).get(topic_id)
-        return dict(raw) if isinstance(raw, dict) else {"topic_id": topic_id}
-
-    def _normalize_target(
-        self,
-        actor: Actor,
-        target: str,
         *,
-        intent_type: str,
-        allow_all: bool = False,
-    ) -> str | ControlResult:
-        target = str(target or "").strip()
-        if intent_type == "focus_topic":
-            if not target:
-                return ControlResult(
-                    ok=False,
-                    code="missing_target",
-                    message="focus_topic 需要提供话题关键字或话题 ID。",
-                )
-            return _clip(target, 200)
-        if target in {"*", "all"}:
-            if allow_all and actor.is_admin:
-                return target
-            return ControlResult(
-                ok=False,
-                code="permission_denied",
-                message="只有管理员可以使用全局关注目标。",
-            )
-        if not target:
-            if actor.group_id:
-                return actor.session
-            return ControlResult(
-                ok=False,
-                code="missing_target",
-                message="该意图需要提供目标群或话题。",
-            )
-        if not actor.is_admin:
-            if actor.group_id and (
-                target == actor.group_id
-                or target == actor.session
-                or target.endswith(f":{actor.group_id}")
-            ):
-                return actor.session
-            return ControlResult(
-                ok=False,
-                code="permission_denied",
-                message="普通成员只能把意图作用于当前会话。",
-            )
-        return target
+        limit: int = 3,
+    ) -> list[str]:
+        ids: list[str] = []
+        for item in (state.get("recent_messages") or {}).get(umo, []):
+            if not isinstance(item, dict) or item.get("is_bot"):
+                continue
+            message_id = str(item.get("message_id") or "").strip()
+            if message_id and message_id not in ids:
+                ids.append(message_id)
+        return ids[-limit:]
 
-    def _resolve_target_group(
+    def _next_schedule(
         self,
-        actor: Actor,
-        target: str,
-    ) -> tuple[str, str, str]:
-        if not target or target in {"*", "all"} or target == actor.session:
-            return actor.group_id, actor.session, actor.platform_id
-        parts = target.split(":", 2)
-        if len(parts) == 3 and parts[1] == "GroupMessage":
-            return parts[2], target, parts[0]
-        return target, f"{actor.platform_id}:GroupMessage:{target}", actor.platform_id
+        moment: datetime,
+        minutes: int | None,
+        expires_at: datetime | None,
+    ) -> datetime:
+        delay = (
+            self.settings.default_interval_minutes if minutes is None else int(minutes)
+        )
+        delay = max(
+            self.settings.min_interval_minutes,
+            min(
+                self.settings.max_interval_minutes,
+                self.settings.max_defer_minutes,
+                delay,
+            ),
+        )
+        desired = self._shift_out_of_quiet(moment, add_minutes(moment, delay))
+        return self._clamp_schedule(moment, desired, expires_at)
+
+    def _clamp_schedule(
+        self,
+        moment: datetime,
+        desired: datetime,
+        expires_at: datetime | None,
+    ) -> datetime:
+        minimum = moment + timedelta(minutes=self.settings.min_interval_minutes)
+        maximum = moment + timedelta(
+            minutes=min(
+                self.settings.max_interval_minutes,
+                self.settings.max_defer_minutes,
+            )
+        )
+        if desired < minimum:
+            desired = minimum
+        if desired > maximum:
+            desired = maximum
+        if expires_at is not None and desired >= expires_at:
+            desired = min(maximum, expires_at - timedelta(minutes=1))
+            if desired < minimum:
+                desired = minimum
+        return desired
+
+    def _shift_out_of_quiet(
+        self,
+        moment: datetime,
+        desired: datetime,
+    ) -> datetime:
+        if not in_quiet_hours(desired, self.settings.quiet_hours):
+            return desired
+        end = quiet_hours_end(desired, self.settings.quiet_hours)
+        if end is None:
+            return desired
+        candidate = end + timedelta(minutes=1)
+        if candidate < moment:
+            candidate = moment + timedelta(minutes=self.settings.min_interval_minutes)
+        maximum = moment + timedelta(
+            minutes=min(
+                self.settings.max_interval_minutes,
+                self.settings.max_defer_minutes,
+            )
+        )
+        return min(candidate, maximum)
 
     def _resolve_expiry(
         self,
@@ -1672,24 +2939,21 @@ class AttentionControlService:
         max_hours: int,
         requested_minutes: int | None,
         allow_permanent: bool,
+        default_minutes: int,
     ) -> datetime | None:
         moment = self.now()
-        if requested_minutes is None:
-            return add_minutes(moment, max_hours * 60)
-        try:
+        if requested_minutes is None or int(requested_minutes) <= 0:
+            minutes = max(1, int(default_minutes))
+        else:
             minutes = int(requested_minutes)
-        except (TypeError, ValueError):
-            minutes = max_hours * 60
-        if minutes <= 0:
-            if allow_permanent and actor.is_admin:
-                return None
-            minutes = max_hours * 60
         if not actor.is_admin:
             minutes = min(minutes, max_hours * 60)
         else:
             minutes = min(
                 minutes, max(self.settings.max_auto_policy_hours, max_hours) * 60
             )
+        if allow_permanent and actor.is_admin and minutes <= 0:
+            return None
         return add_minutes(moment, minutes)
 
     def _clamp_policy_expiry(
@@ -1708,8 +2972,7 @@ class AttentionControlService:
                 return add_minutes(moment, self.settings.max_auto_policy_hours * 60)
             if source == SOURCE_MAIN_AGENT:
                 return add_minutes(
-                    moment,
-                    self.settings.main_agent_max_policy_hours * 60,
+                    moment, self.settings.main_agent_max_policy_hours * 60
                 )
             return None
         if source == SOURCE_ATTENTION_AGENT:
@@ -1722,14 +2985,6 @@ class AttentionControlService:
             )
             return min(expires_at, limit)
         return expires_at
-
-    def _shift_out_of_quiet(self, desired: datetime) -> datetime:
-        if not in_quiet_hours(desired, self.settings.quiet_hours):
-            return desired
-        end = quiet_hours_end(desired, self.settings.quiet_hours)
-        if end is None:
-            return desired
-        return end
 
     def _actor_can_write_source(self, actor: Actor, source: str) -> bool:
         if actor.source == SOURCE_SYSTEM:
@@ -1751,48 +3006,71 @@ class AttentionControlService:
         return False
 
     def _flush_locked(self) -> None:
-        try:
-            self.store.flush()
-        except Exception:
-            logger.exception("Failed to persist attention control state.")
+        self.cleanup_locked(self.store.state, self.now())
+        self.store.flush()
 
-    def _record_control_decision_locked(
+    def _record_decision_locked(
         self,
         state: dict[str, Any],
-        actor: Actor,
         *,
-        decision: str,
+        umo: str,
+        kind: str,
+        trigger: str,
+        code_decision: str,
         reason: str,
+        suggested_action: str = "",
+        code: str = "",
+        interest_id: str = "",
+        checkpoint_id: str = "",
+        anchor_message_id: str = "",
         related_policy_id: str = "",
         related_directive_id: str = "",
-        checkpoint_id: str = "",
+        reservation_id: str = "",
+        wake_source: str = "unknown",
+        model_suggestion: str = "",
+        message_seq: int = 0,
+        cached: bool = False,
     ) -> None:
-        source = (
-            actor.source
-            if actor.source in {SOURCE_ADMIN, SOURCE_MAIN_AGENT}
-            else "active_agent"
-        )
+        store = self.store
         record = {
             "timestamp": to_iso(self.now()),
-            "kind": "control",
-            "umo": actor.session,
-            "trigger": actor.source,
-            "decision": decision,
+            "kind": kind,
+            "umo": umo,
+            "trigger": trigger,
+            "wake_source": wake_source,
+            "decision": code_decision,
+            "code_decision": code_decision,
+            "suggested_action": suggested_action,
+            "model_suggestion": _clip(model_suggestion, 500),
+            "rejection_code": code,
             "interest": "none",
             "reason": _clip(reason, self.settings.max_reason_chars),
-            "source": source,
+            "source": (
+                "main_agent"
+                if trigger == SOURCE_MAIN_AGENT
+                else "admin"
+                if trigger == SOURCE_ADMIN
+                else "attention_agent"
+            ),
+            "interest_id": interest_id,
+            "checkpoint_id": checkpoint_id,
+            "anchor_message_id": anchor_message_id,
             "related_policy_id": related_policy_id,
             "related_directive_id": related_directive_id,
-            "checkpoint_id": checkpoint_id,
+            "reservation_id": reservation_id,
+            "message_seq": int(message_seq or 0),
+            "cached": bool(cached),
             "tool_calls": [],
             "checkpoint_changes": [],
             "main_model": "none",
             "send": "none",
         }
-        decisions = state.setdefault("decisions", [])
-        if not isinstance(decisions, list):
-            decisions = []
-            state["decisions"] = decisions
-        decisions.append(record)
-        limit = max(10, int(self.settings.max_decision_log))
-        del decisions[: max(0, len(decisions) - limit)]
+        store.record_decision(record)
+
+
+def expires_in_minutes_from_minutes(minutes: int | None) -> int | None:
+    """Translate a scheduling delay into a directive validity window."""
+
+    if minutes is None:
+        return None
+    return max(1, int(minutes)) + 60

@@ -3,10 +3,15 @@
 AstrBot exposes plugin configuration as a mutable dictionary. The core consumes
 this snapshot instead, which makes defaults and bounds explicit and keeps tests
 free of AstrBot imports.
+
+The ``attention_limits`` group controls session resources. Legacy keys
+(``daily_active_message_budget`` and ``scheduling.group_send_cooldown_minutes``)
+are still read when the new keys are absent so an upgrade keeps its old values.
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import tzinfo
@@ -17,6 +22,8 @@ from .timeutil import resolve_timezone
 
 PASSIVE_MODES = frozenset({"off", "block_only", "full"})
 LOG_LEVELS = frozenset({"INFO", "DEBUG", "WARNING", "ERROR"})
+NO_PROGRESS_LIMIT = 3
+_WARNED_COMPATIBILITY: set[str] = set()
 
 
 def _bool(value: Any, default: bool) -> bool:
@@ -77,6 +84,15 @@ def _get(data: Mapping[str, Any], section: str, key: str) -> Any:
     return data.get(key)
 
 
+def _first(*values: Any) -> Any:
+    """Return the first explicit value, skipping the legacy inheritance sentinel."""
+
+    for value in values:
+        if value is not None and str(value) != "-1":
+            return value
+    return None
+
+
 @dataclass(frozen=True)
 class Settings:
     """A validated snapshot of plugin configuration."""
@@ -99,11 +115,17 @@ class Settings:
     max_interval_minutes: int = 1440
     default_interval_minutes: int = 60
     max_defer_minutes: int = 1440
-    group_send_cooldown_minutes: int = 30
     global_send_cooldown_minutes: int = 10
+    session_autonomous_cooldown_minutes: int = 10
     daily_model_call_budget: int = 200
-    daily_active_message_budget: int = 10
+    daily_autonomous_reply_budget: int = 10
     daily_active_check_budget: int = 50
+    max_interests_per_session: int = 3
+    interest_ttl_minutes: int = 120
+    interest_check_limit: int = 3
+    min_evaluation_interval_seconds: int = 30
+    opportunity_ttl_minutes: int = 10
+    session_autonomous_reply_budget: int = 6
     max_agent_rounds: int = 4
     max_tool_calls: int = 6
     max_checkpoint_mutations: int = 2
@@ -135,6 +157,10 @@ class Settings:
         if self.persona_source == "custom":
             return self.custom_persona
         return ""
+
+    @property
+    def no_progress_limit(self) -> int:
+        return NO_PROGRESS_LIMIT
 
     @classmethod
     def from_mapping(
@@ -191,6 +217,43 @@ class Settings:
             min_interval,
             43200,
         )
+        for new_key, old_section, old_key in (
+            ("daily_autonomous_reply_budget", "budgets", "daily_active_message_budget"),
+            (
+                "session_autonomous_cooldown_minutes",
+                "scheduling",
+                "group_send_cooldown_minutes",
+            ),
+        ):
+            old_value = _get(data, old_section, old_key)
+            if old_value is not None and new_key not in _WARNED_COMPATIBILITY:
+                _WARNED_COMPATIBILITY.add(new_key)
+                logging.getLogger("astrbot").warning(
+                    "Attention config compatibility: %s inherits %s when absent or -1; "
+                    "an explicit new value takes precedence.",
+                    new_key,
+                    old_key,
+                )
+        session_cooldown = _int(
+            _first(
+                _get(data, "attention_limits", "session_autonomous_cooldown_minutes"),
+                _get(data, "scheduling", "group_send_cooldown_minutes"),
+                data.get("group_send_cooldown_minutes"),
+            ),
+            10,
+            0,
+            1440,
+        )
+        daily_autonomous = _int(
+            _first(
+                _get(data, "attention_limits", "daily_autonomous_reply_budget"),
+                _get(data, "budgets", "daily_active_message_budget"),
+                data.get("daily_active_message_budget"),
+            ),
+            10,
+            0,
+            10000,
+        )
         return cls(
             enabled=_bool(_get(data, "general", "enabled"), True),
             passive_mode=passive_mode,
@@ -225,35 +288,61 @@ class Settings:
             max_interval_minutes=max_interval,
             default_interval_minutes=default_interval,
             max_defer_minutes=max_defer,
-            group_send_cooldown_minutes=_int(
-                _get(data, "scheduling", "group_send_cooldown_minutes"),
-                30,
-                0,
-                10080,
-            ),
             global_send_cooldown_minutes=_int(
                 _get(data, "scheduling", "global_send_cooldown_minutes"),
                 10,
                 0,
                 10080,
             ),
+            session_autonomous_cooldown_minutes=session_cooldown,
             daily_model_call_budget=_int(
                 _get(data, "budgets", "daily_model_call_budget"),
                 200,
                 0,
                 100000,
             ),
-            daily_active_message_budget=_int(
-                _get(data, "budgets", "daily_active_message_budget"),
-                10,
-                0,
-                1000,
-            ),
+            daily_autonomous_reply_budget=daily_autonomous,
             daily_active_check_budget=_int(
                 _get(data, "budgets", "daily_active_check_budget"),
                 50,
                 0,
                 10000,
+            ),
+            max_interests_per_session=_int(
+                _get(data, "attention_limits", "max_interests_per_session"),
+                3,
+                1,
+                20,
+            ),
+            interest_ttl_minutes=_int(
+                _get(data, "attention_limits", "interest_ttl_minutes"),
+                120,
+                10,
+                10080,
+            ),
+            interest_check_limit=_int(
+                _get(data, "attention_limits", "interest_check_limit"),
+                3,
+                1,
+                20,
+            ),
+            min_evaluation_interval_seconds=_int(
+                _get(data, "attention_limits", "min_evaluation_interval_seconds"),
+                30,
+                1,
+                3600,
+            ),
+            opportunity_ttl_minutes=_int(
+                _get(data, "attention_limits", "opportunity_ttl_minutes"),
+                10,
+                1,
+                120,
+            ),
+            session_autonomous_reply_budget=_int(
+                _get(data, "attention_limits", "session_autonomous_reply_budget"),
+                6,
+                0,
+                1000,
             ),
             max_agent_rounds=_int(
                 _get(data, "agent_limits", "max_agent_rounds"), 4, 1, 20

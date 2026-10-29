@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from astrbot.api import logger
+from astrbot.api.message_components import At, Reply
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.provider.entities import ProviderRequest
@@ -175,6 +176,7 @@ class AstrBotContextProvider:
             except Exception:
                 continue
             if message is not None and message.text.strip():
+                message.umo = umo
                 result.append(message)
         return result
 
@@ -205,7 +207,7 @@ class AstrBotContextProvider:
         role = "bot" if content.get("type") == "bot" else "user"
         created = getattr(record, "created_at", None)
         if not isinstance(created, datetime):
-            created = datetime.now(timezone.utc)
+            return None
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
         local_created = created.astimezone(self.settings.tz)
@@ -216,7 +218,10 @@ class AstrBotContextProvider:
             text=text,
             created_at=local_created.isoformat(timespec="seconds"),
             created_ts=created.timestamp(),
-            message_id=str(getattr(record, "id", "") or ""),
+            message_id=str(
+                content.get("message_id") or f"history:{getattr(record, 'id', '')}"
+            ),
+            source="history",
             is_bot=role == "bot",
         )
 
@@ -253,10 +258,73 @@ class AstrBotMessageSender:
             raise
         except Exception as exc:
             logger.exception("Sending proactive message to %s failed.", umo)
-            return False, safe_error(f"{type(exc).__name__}: ", exc)
+            return False, "uncertain_delivery:" + safe_error(
+                f"{type(exc).__name__}: ", exc
+            )
         if not sent:
             return False, "platform not found for session"
         return True, ""
+
+
+def _raw_message_text(event: AstrMessageEvent) -> str:
+    """Return the platform message text before AstrBot strips the wake prefix."""
+
+    message_obj = getattr(event, "message_obj", None)
+    raw = getattr(message_obj, "raw_message", None)
+    message = raw.get("message") if isinstance(raw, dict) else None
+    if isinstance(message, list):
+        parts = [
+            str((segment.get("data") or {}).get("text") or "")
+            for segment in message
+            if isinstance(segment, dict) and segment.get("type") == "text"
+        ]
+        text = "".join(parts)
+        if text:
+            return text
+    parts = []
+    for component in getattr(event, "get_messages", lambda: [])():
+        text = getattr(component, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+    return "".join(parts)
+
+
+def classify_wake_source(
+    event: AstrMessageEvent,
+    wake_prefixes: tuple[str, ...],
+) -> str:
+    """Classify why this event reached the main model.
+
+    AstrBot only reports the combined ``is_at_or_wake_command`` flag and strips
+    the wake prefix before hooks run. This function therefore inspects the
+    trusted message components and the raw platform payload, never model text.
+
+    Args:
+        event: Incoming AstrBot event.
+        wake_prefixes: Configured non-empty wake prefixes.
+
+    Returns:
+        One of ``private``, ``mention``, ``reply_to_bot``, ``wake_prefix``,
+        ``ambient`` or ``unknown``.
+    """
+
+    if not event.get_group_id():
+        return "private"
+    self_id = str(getattr(event, "get_self_id", lambda: "")() or "")
+    messages = getattr(event, "get_messages", lambda: [])()
+    for component in messages:
+        if isinstance(component, At) and str(component.qq) == self_id:
+            return "mention"
+    for component in messages:
+        if isinstance(component, Reply) and str(component.sender_id) == self_id:
+            return "reply_to_bot"
+    raw_text = _raw_message_text(event)
+    for prefix in wake_prefixes:
+        if prefix and raw_text.startswith(prefix):
+            return "wake_prefix"
+    if getattr(event, "is_at_or_wake_command", False):
+        return "unknown"
+    return "ambient"
 
 
 def build_passive_request(
@@ -265,11 +333,26 @@ def build_passive_request(
     *,
     is_command: bool,
     timestamp: str,
+    wake_prefixes: tuple[str, ...] = (),
+    friend_needs_wake_prefix: bool = False,
 ) -> Any:
-    """Convert an AstrBot LLM request into a core passive request."""
+    """Convert an AstrBot LLM request into a core passive request.
+
+    Args:
+        event: Trusted platform event.
+        request: Main-model request assembled by AstrBot.
+        is_command: Whether the event is a command.
+        timestamp: Session-local ISO timestamp.
+        wake_prefixes: Configured wake prefixes, used to classify the source.
+        friend_needs_wake_prefix: Whether private chats also require a prefix.
+
+    Returns:
+        A normalised :class:`PassiveRequest`.
+    """
 
     from .attention.models import PassiveRequest
 
+    _ = friend_needs_wake_prefix
     contexts: list[dict[str, Any]] = []
     for item in getattr(request, "contexts", None) or []:
         if isinstance(item, dict):
@@ -307,8 +390,11 @@ def build_passive_request(
         group_id=str(event.get_group_id() or ""),
         user_id=str(event.get_sender_id() or ""),
         sender_name=str(event.get_sender_name() or ""),
-        message_id=str(getattr(event.message_obj, "message_id", "") or ""),
+        message_id=str(
+            getattr(getattr(event, "message_obj", None), "message_id", "") or ""
+        ),
         message_text=str(event.message_str or ""),
+        wake_source=classify_wake_source(event, wake_prefixes),
         is_group=bool(event.get_group_id()),
         is_admin=bool(event.is_admin()),
         is_command=is_command,

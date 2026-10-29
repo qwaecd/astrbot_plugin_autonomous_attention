@@ -1,19 +1,17 @@
 # 自主注意力（Autonomous Attention）
 
-一个运行在 AstrBot 之上的注意力决策插件。它把“是否该关注、是否该接话、什么时候主动去看看”从固定规则中抽离出来，交给一个可配置的兴趣决策模型，同时保留代码层的硬性边界。
+一个运行在 AstrBot 之上的会话级注意力插件。它把“是否该关注、是否该接话、什么时候主动去看看”从固定规则中抽离出来，交给一个可配置的兴趣决策模型；所有资源变更和发言许可仍由代码层批准。
 
-## 功能
+## 核心模型
 
-- **被动注意力**：在 AstrBot 已经唤醒 Bot（私聊、@、唤醒词等）之后、主模型真正生成回复之前，判断这条消息是否值得交给主模型。
-- **主动注意力**：按检查点时间去白名单群聊读取有限的消息窗口，由一个受限 Agent 观察、判断、调用工具，最后决定参与、跳过、继续观察或结束关注。
-- **主从协作**：主模型是主 Agent，拥有明确意图的最高执行权；注意力 Agent 是后台执行单元，不得覆盖主 Agent 意图或管理员策略。
-- **统一控制层**：主模型工具、被动路径和主动路径的用户策略、检查点与主 Agent 意图都通过 `AttentionControlService` 校验后写入。
-- **主模型按需工具**：主模型可以通过 `attention_query` 查询状态，通过 `attention_ignore_user` 等工具表达关注/忽略/停止关注意图，而不是每次接收动态系统上下文。
-- **硬性策略**：用户忽略、群聊白名单/黑名单、管理员覆盖、静默时段、单群/全局冷却、每日模型调用与主动发言预算。硬性策略始终优先于兴趣模型输出。
-- **结构化校验**：所有模型输出都必须是合法 JSON；非法输出默认转为 `observe`，不会默认放行，更不会直接发送消息。
-- **状态持久化**：检查点、话题状态、用户策略、主 Agent 意图、预算、决策记录和最近消息窗口都会写入 JSON，插件重启后恢复。
-- **dry-run**：仍会调用兴趣模型并记录决策，但不会拦截主模型，也不会真正发送主动消息。
-- **后台任务可停止**：调度器、手动检查和模型调用任务都会在插件卸载时取消。
+- **会话隔离**：兴趣、参与机会、检查点、关注/停止意图、消息进度、自主参与配额都以 AstrBot `unified_msg_origin`（UMO）为唯一所有权键。群号只用于路由和白名单，不能跨会话共享兴趣或检查点。
+- **隔离会话路由**：启用成员隔离时，保留事件提供的真实群号与完整 UMO；同群不同 UMO 的兴趣和额度仍相互独立。尚未观察到的隔离 UMO 需要显式提供真实群号才能创建检查点。
+- **兴趣（Interest）**：长期关注对象，带摘要、等待条件、证据消息、期限、剩余检查次数和无进展计数。默认每会话最多 3 个未关闭兴趣，默认有效期 120 分钟、检查余额 3 次。
+- **参与机会（Opportunity）**：一次具体参与的证据锚点，必须引用本会话消息 ID、给出预计新增内容，并在有效期内未被消费。同一锚点跨主动/被动、换兴趣或换动作类型都只能获批一次。
+- **检查点（Checkpoint）**：调度记录，分 `interest`（绑定兴趣）和 `session_scan`（管理员/种子扫描）。同一会话同一兴趣只保留一个未结束检查点；同一会话最多一个扫描检查点。
+- **统一许可**：被动自主 `reply` 与主动 `participate` 都经过同一个控制合同：会话与硬策略 → 证据锚点 → 机会占用/过期 → 会话与全局自主配额 → 原子预留 → 生成/放行 → 提交结果。
+- **显式请求优先**：私聊、@Bot、引用 Bot、唤醒前缀视为显式请求；硬策略通过后直接放行主模型，不占用兴趣槽位和自主配额。`unknown` 来源按自主路径保守处理。
+- **关注不等于发言**：主 Agent 的 `focus_group` / `focus_topic` 只提高本会话兴趣优先级并记录证据，不再强制 `pass`；仍要经过证据和参与许可。
 
 ## 运行要求
 
@@ -25,181 +23,168 @@
 1. 将本目录放到 `AstrBot/data/plugins/astrbot_plugin_autonomous_attention`。
 2. 在 WebUI 插件页重载插件。
 3. 打开插件配置，至少设置：
-   - `passive_mode`：建议先使用 `block_only` 验证硬性策略，再切到 `full`。
-   - `decision_provider_id`：兴趣决策模型。留空则使用当前会话主模型。
-   - `main_provider_id`：主动回复模型。留空则使用当前会话主模型。
-   - `group_allowlist`：唯一群聊白名单，决定哪些群可以被观察、建立检查点、执行检查并接收主动消息；**留空表示不启用任何群聊的注意力功能**。
-   - `main_agent_tools_enabled`：是否把 `attention_query` 等工具提供给主模型。
-   - `quiet_hours`、冷却和每日预算。
-4. 先用 `/attention dryrun on` 观察决策日志，确认行为后再关闭 dry-run。
+   - `passive_mode`：建议先用 `block_only` 验证硬策略，再切到 `full`。
+   - `decision_provider_id` / `main_provider_id`：兴趣模型与主动回复模型，留空使用当前会话模型。
+   - `group_allowlist`：唯一群聊白名单；**留空表示不启用任何群聊注意力功能**。
+   - `attention_limits`：兴趣容量、期限、检查余额、评估间隔和自主参与配额。
+4. 先用 `/attention dryrun on` 观察决策，再关闭 dry-run。
 
-> `group_allowlist` 是唯一群聊边界：能建立检查点的群，就是能接收主动消息的群；不能建立检查点的群，
-> 也无法通过指令强制建立。私聊的被动注意力不受这个群聊白名单影响。
+> `group_allowlist` 是唯一群聊边界：能建立检查点的群才能接收主动消息；私聊只走被动判断，不受群白名单影响。
 
 ## 被动路径
 
 ```text
-AstrBot 唤醒事件
-  → 代码级硬性策略（用户忽略、群聊限制、管理员覆盖）
-  → 读取主 Agent 意图（focus/ignore/stop）
-  → passive_mode 检查
-  → 读取主模型已构建的 system prompt / contexts
-  → 调用兴趣决策模型（只调用一次）
-  → 校验 JSON
-  → pass / ignore / observe / policy_update / retry_later
+AstrBot 唤醒事件（私聊/@/引用/唤醒前缀）
+  → 硬策略（用户忽略、白名单/黑名单、管理员覆盖）
+  → 唤醒来源分类（private/mention/reply_to_bot/wake_prefix/unknown）
+  → 显式请求：直接放行主模型（不走兴趣模型、不占自主配额）
+  → 自主来源：会话节流 → 全局模型预算 → 兴趣模型一次
+  → 机会证据校验 → 统一参与许可
+  → pass（获批）或 observe/ignore（拒绝）
 ```
 
-- `pass`：不拦截，继续 AstrBot 原有主模型流程（主模型只会执行一次）。
-- `ignore`：拦截当前消息，不调用主模型。
-- `observe`：拦截当前消息，但保存话题/兴趣状态。
-- `policy_update`：通过控制层写入临时用户策略后拦截。
-- `retry_later`：拦截，并为当前群创建一个稍后检查的检查点。
-
-被动路径通过 `on_llm_request` 钩子实现，因此它看到的上下文与主模型实际收到的上下文一致。模型超时或网络错误时采用 fail-open（放行主模型）并记录错误；只有“返回了非法结构”时才 fail-safe 为 `observe`。
-
-如果存在当前会话的主 Agent `focus_group` / `focus_topic` 意图，被动路径会优先放行主模型，不再让注意力 Agent 的临时判断拦截；主 Agent `ignore_user` 策略会在下一条消息到达时由硬性策略直接生效。
+- 显式请求：`private`、`mention`、`reply_to_bot`、`wake_prefix`。即使 `passive_mode=full` 也直接放行；`ignore_user` 等硬策略仍然优先。
+- 自主来源：`unknown`（无法确认来源，保守处理）或 `ambient`。没有新外部消息、未到最小评估间隔、配额不足或重复事件时直接 `observe`，不调用模型。
+- 自主建议 `reply` 时必须引用本会话证据锚点并说明新增贡献，否则拒绝；拒绝不会默认放行。
+- `observe` 也可通过 `interest_update` 提交摘要、等待条件和新证据，准入后建立有限检查点。重复证据、Bot 自身回复和只改摘要都不能续期。
+- 模型超时、网络错误、非法结构或插件调用预算耗尽时统一 `observe`（拦截主模型），不再 fail-open。
+- `pass` 只代表交给 AstrBot 主模型，不代表平台发送成功；`on_llm_response` 只用于关联生成结果并消费已预留机会。
 
 ## 主动路径
 
-1. 检查点到达后，调度器原子地领取检查点（状态变为 `running`），防止同一检查点被执行两次。
-2. 读取 AstrBot 群历史（若启用）与插件自己维护的滑动窗口，合并、去重、截断。
-3. 加载人格、评判标准、检查点、话题状态、主 Agent 意图和策略摘要。
-4. 运行受限 Agent 循环，最多受以下配置约束：
-   - `max_agent_rounds`
-   - `max_tool_calls`
-   - `max_checkpoint_mutations`
-   - `max_main_model_calls`
-   - `decision_timeout_seconds`
-   - 每日模型调用/检查/发言预算
-5. Agent 可调用这些后台工具：
-   - `read_messages`、`get_topic`
+1. 调度器按会话轮转选择到期检查点，原子领取（`running` + `run_id`），同会话不重入。
+2. 校验所有权、状态、TTL、剩余检查、白名单和静默时段；无新消息时跳过模型并退避（`min_interval × 2**no_progress`）。
+3. 有未评估外部消息或管理员强制检查时，读取本会话窗口（带稳定消息 ID），运行受限 Agent。
+4. Agent 工具：
+   - `read_messages`、`get_interest`
    - `schedule_next_check`、`defer_check`
-   - `create_checkpoint`
+   - `create_checkpoint`（只能引用本会话已准入兴趣）
    - `update_user_policy`
    - `record_interest`
    - `request_main_reply` / `participate`
    - `observe`、`skip`、`end_focus`
-6. 注意力 Agent 的关注、忽略和检查点动作都必须通过控制层；它不能覆盖主 Agent 意图或管理员策略。
-7. 只有最终动作为 `participate` / `request_main_reply` 时，才调用主模型生成回复。
-8. 发送前重新读取有效策略和主 Agent 意图，再次检查白名单、静默时段、冷却、每日发言预算；发送失败不会重试同一内容，而是按最短间隔重新安排检查。
-9. 检查点、话题、预算、主 Agent 意图和决策记录在同一状态文件中持久化。
+5. 最终 `participate` 必须附带机会证据；通过统一许可后原子预留机会与配额，再生成回复。
+6. 生成前和发送前复核：新外部消息（stale snapshot）、停止意图、兴趣状态、预算。失败/空回复/发送失败/结果不明分别记录，且不自动重发同一锚点。
+7. 发送成功消费机会；兴趣继续观察，不因自己发言续期或增加检查余额。
+
+同会话到期任务合并一轮判断时，其他兴趣仍保留独立检查点。模型通过 `arguments.evaluated_interest_ids` 列出实际评估过的兴趣；未评估的兴趣不会被扣除检查余额或推进游标。历史数据库 ID 与实时消息 ID 分开标识，并优先合并到实时消息身份；没有可信时间的消息不能成为自主参与锚点。
 
 ## 主模型注意力工具
 
-主模型通过 AstrBot 的工具调用接口按需使用这些工具。工具名使用下划线形式（兼容主流 Function Calling API），对应方案中的职责：
-
 | 工具 | 作用 |
 | --- | --- |
-| `attention_query` | 查询当前会话范围内的用户忽略、群关注、话题、主 Agent 意图和最近事件摘要 |
-| `attention_set_intent` | 表达 `focus_group`、`focus_topic`、`ignore_user`、`stop_focus`、`schedule_check` 意图 |
-| `attention_ignore_user` | 创建有时限的用户忽略策略；普通成员不能创建永久策略 |
-| `attention_clear_user_policy` | 解除用户忽略策略；不能解除管理员策略 |
-| `attention_focus_topic` | 设置主 Agent 的话题关注 |
-| `attention_stop_focus` | 停止关注目标，撤销主 Agent 相关意图 |
+| `attention_query` | 查询当前会话的会话、兴趣、检查点、意图和最近决策；`all` 仅表示会话内全部类别 |
+| `attention_set_intent` | `focus_group`、`focus_topic`、`ignore_user`、`stop_focus`、`schedule_check` |
+| `attention_ignore_user` | 创建有时限的用户忽略策略 |
+| `attention_clear_user_policy` | 解除用户忽略策略 |
+| `attention_focus_topic` | 设置当前会话的话题关注（提高兴趣优先级，不强制放行） |
+| `attention_stop_focus` | 停止当前会话中主 Agent 发起的关注/检查 |
 
-工具结果始终是 JSON，包含 `ok`、`code`、`message` 和实际生效数据。主模型不应仅根据“发起了工具调用”假设操作成功。
-
-权限来自真实事件发送者和会话：
-
-- 普通成员只能查询自己的策略、只能解除针对自己的策略；不能设置全局策略，不能设置群级 `focus_group`，不能使用全局 `stop_focus`。普通成员可以使用 `focus_topic` 和有时限的 `ignore_user`。
-- 普通成员通过主模型创建的忽略策略和时间意图受 `main_agent_max_policy_hours` / `main_agent_max_intent_hours` 限制；只能停止自己会话中由主 Agent 发起的关注/检查意图。
-- 管理员可以使用管理指令创建更长期或永久策略，也可以设置群级关注或停止其他检查。
-- 主 Agent 可以覆盖注意力 Agent 的临时策略，但不能覆盖管理员策略；注意力 Agent 不能修改主 Agent 意图。
-
-这些动态状态**不会**默认拼接到主模型系统提示词；主模型需要时通过 `attention_query` 获取。
+工具结果是 JSON（`ok`/`code`/`message`/`data`）。模型不能指定其他会话的 UMO 或 ID；跨会话读取/修改会被拒绝。`focus_topic` 会给本会话准入一个兴趣并记录证据，但不会绕过证据与配额。
 
 ## 管理指令
 
-所有指令需要管理员权限：
+所有指令需要管理员权限，默认作用于**当前会话**；`--all` 表示显式全局汇总，不能用于修改其他会话资源。
 
 | 指令 | 作用 |
 | --- | --- |
-| `/attention status` | 查看模式、检查点统计、预算、调度器状态和最近决策 |
-| `/attention list` | 列出检查点 |
-| `/attention add [分钟] [原因]` | 为当前群创建检查点 |
+| `/attention status [UMO\|--all]` | 状态、兴趣数、机会数、预算、调度器和最近决策 |
+| `/attention list [UMO\|--all]` | 检查点列表 |
+| `/attention interests [UMO\|--all]` | 兴趣列表 |
+| `/attention add [分钟] [原因]` | 为当前群创建扫描检查点 |
 | `/attention add <UMO> [分钟] [原因]` | 为指定群创建检查点 |
-| `/attention check <ID>` | 立即执行一次检查 |
-| `/attention pause <ID>` / `resume` / `remove` | 暂停、恢复、取消检查点 |
-| `/attention ignore <用户ID或@成员> [时长] [原因]` | 设置忽略策略；时长支持 `30m`、`2h`、`1d`、`永久` |
-| `/attention unignore <用户ID或@成员>` | 解除当前群和全局忽略策略 |
+| `/attention check <ID>` | 立即强制检查一次 |
+| `/attention pause\|resume\|remove <ID>` | 暂停/恢复/取消检查点 |
+| `/attention ignore <用户\|@成员> [时长] [原因]` | 设置忽略策略（`30m`、`2h`、`1d`、`永久`） |
+| `/attention unignore <用户\|@成员>` | 解除当前群和全局忽略 |
 | `/attention policies` | 列出忽略策略 |
-| `/attention budget` | 查看当天预算 |
+| `/attention budget [UMO\|--all]` | 查看当天预算 |
 | `/attention dryrun on\|off` | 切换 dry-run |
 | `/attention help` | 显示帮助 |
 
 别名：`/aa`、`/注意力`。
 
-> 只有在 `group_allowlist` 内的群才能创建检查点；命令添加和配置种子检查点使用同一套校验，不能用指令绕过白名单。
+## 预算与限制
 
-## 配置要点
+- **模型/语义检查预算**（全局）：`daily_model_call_budget`、`daily_active_check_budget`；只统计插件自身 gateway 调用，不覆盖 AstrBot 原始主模型的全部调用。
+- **自主参与预算**：每会话 `session_autonomous_reply_budget` + 全局 `daily_autonomous_reply_budget`；获批尝试时原子扣减，失败不返还。显式请求不计入。
+- **冷却**：`global_send_cooldown_minutes` 与 `session_autonomous_cooldown_minutes`，从获批尝试计时，失败不消除本次冷却。
+- **无进展**：连续 3 次无进展、检查余额耗尽、TTL 到期、明确结束或被更高优先级兴趣替换时关闭兴趣并取消关联检查点。
+- **容量**：槽位满时只有更高等级的新候选可替换最弱可替换兴趣；同等级保留原兴趣；管理员兴趣受保护。
 
-完整配置项见 `_conf_schema.json`。配置已按 AstrBot 的嵌套 `object` 写法分组，WebUI 中会显示为以下类别：
+## 配置分组
 
-- `general` 基础设置：`enabled`、`passive_mode`、`active_enabled`、`main_agent_tools_enabled`、`dry_run`、`log_level`、`timezone`、`max_decision_log`、`max_concurrent_decisions`。
-- `models` 模型与人格：`decision_provider_id`、`main_provider_id`、`persona_source`、`custom_persona`、`passive_criteria`、`active_criteria`。
-- `groups` 群聊边界：`group_allowlist`、`blocked_group_ids`。
-- `context` 上下文窗口：`context_window_messages`、`context_max_chars`、`max_context_sessions`。
-- `scheduling` 检查点与冷却：`quiet_hours`、检查间隔、主动发言冷却、`passive_retry_delay_minutes`、`seed_checkpoints`。
-- `agent_limits` Agent 限制：轮数、工具调用、检查点修改、主模型调用、超时和输出长度。
-- `budgets` 预算与策略时限：每日模型/检查/发言预算，注意力 Agent/主 Agent 自动策略时限。
-- `safety` 安全与覆盖：`owner_override`。
+- `general`：开关、被动模式、`dry_run`、日志、时区、决策记录上限、并发。
+- `models`：兴趣模型/主模型、人格、两套评判标准。
+- `groups`：唯一群白名单与禁止群。
+- `context`：窗口条数、字符上限、保留会话数。
+- `scheduling`：静默时段、检查间隔、全局冷却、`retry_later` 延迟、种子检查点。
+- `agent_limits`：主动 Agent 轮数、工具调用、检查点修改、主模型调用、超时和输出长度。
+- `attention_limits`：兴趣容量/期限/检查余额、最小评估间隔、机会期限、每会话自主配额、会话冷却、全局自主配额。
+- `budgets`：模型调用、主动检查、全局自主尝试预算，以及策略/意图时限。
+- `safety`：`owner_override`。
 
-关键项说明：
+`attention_limits.daily_autonomous_reply_budget` 和 `session_autonomous_cooldown_minutes` 的配置默认值为 `-1`，表示继承旧配置；无旧值时实际默认均为 10。显式设置新值（包括 0）优先。兼容旧平铺键、分组键及 AstrBot Schema 自动补齐；旧字段保留为隐藏兼容项，并输出一次兼容提示。
 
-- `passive_mode`：`off` / `block_only` / `full`。
-- `active_enabled`：是否执行检查点。
-- `decision_provider_id` / `main_provider_id`：兴趣模型与主模型可分开配置。
-- `persona_source`：`astrbot` 使用 AstrBot 人格，`custom` 使用 `custom_persona`。
-- `passive_criteria` / `active_criteria`：两条路径使用不同的评判标准；留空使用内置标准。
-- `group_allowlist`：唯一群聊白名单；只有这里面的群可以被观察、建立检查点、执行检查并接收主动消息。为空表示不启用任何群聊的注意力功能。
-- `blocked_group_ids`：完全禁止参与和检查的群（优先级高于 `group_allowlist`）。
-- `quiet_hours`：例如 `23:00-08:00`，支持跨午夜。
-- `max_auto_policy_hours`：注意力 Agent 临时策略最长时间。
-- `main_agent_max_policy_hours` / `main_agent_max_intent_hours`：主模型工具创建忽略策略和意图的默认/上限时间。
-- `main_agent_tools_enabled`：是否允许主模型调用 `attention_*` 工具。
-- `dry_run` / `log_level`：调试与安全开关。
-- `seed_checkpoints`：可选的初始检查点配置；使用过的条目不会重复创建。
+## 状态迁移与恢复
 
-> 从旧的平铺配置升级时，AstrBot 会按新 Schema 重建配置结构。请升级后在 WebUI 中检查各分组值；插件仍兼容读取旧的平铺键用于测试/过渡，但新配置会写入分组结构。
+- 状态版本为 `2`。首次加载 v1 时先备份为 `attention_state.v1-<时间戳>.json`，再原子写入 v2；迁移失败不会覆盖原文件，插件启动会报错而非以空状态继续。
+- v1 的 `topics` 转为所属 UMO 的 `interests`；带 `topic_id` 的检查点迁移为 `interest`，无关联的转为有限期 `session_scan`。
+- 无法确定所有权的兴趣/意图会暂停并记录迁移原因，不会被任何会话读取为当前状态。
+- 多个会话引用同一旧话题、路由冲突等歧义会隔离原记录；扫描检查点也会获得一次性的 TTL 与检查余额。无法读取的状态文件会备份并停止启动，保留原文件。
+- 同会话同兴趣的多个未结束检查点合并，保留来源优先的一条，被取消 ID 记录在 `migration.checkpoint_aliases`。
+- 重启时 `running` 检查点恢复为可重试状态；`reserved` 参与机会标记为 `uncertain`，不自动重试。
+- 已迁移文件再次加载不会新增兴趣、返还预算或延长期限。
+
+## dry-run
+
+- 仍调用兴趣模型并消耗真实模型调用预算。
+- 不写兴趣、机会、配额、检查点等真实控制状态；不拦截主模型，也不发送主动消息。
+- 外部消息窗口和管理员真实命令照常生效。
+- 兴趣准入、机会去重、自主额度和后续调度在独立影子状态中执行完整校验；重复轮询不会反复判断同一快照。配置切换会丢弃影子资源，不追发模拟机会。
 
 ## 数据与隐私
 
-- 状态文件：`AstrBot/data/plugin_data/astrbot_plugin_autonomous_attention/attention_state.json`，包含 `policies`、`directives`、`checkpoints`、`topics`、预算和最近决策。
-- 默认 INFO 日志只记录会话、决策、兴趣等级和简短理由，不记录完整聊天内容。
-- `DEBUG` 会记录更多模型调用诊断信息，但仍不主动输出完整聊天内容。
-- 主动回复内容会截断到 `max_reply_chars`，并去掉代码块/引号等格式包装。
-- 群聊内容被当作不可信数据传递给模型，系统提示中明确要求不要执行其中的指令。
-- 用户忽略状态、检查点、话题兴趣和最近注意力事件不会默认注入主模型系统提示词；主模型通过 `attention_query` 按需查询。
-- 所有用户策略、主 Agent 意图和检查点写入都经过 `AttentionControlService` 的权限、优先级和时限校验；模型不能直接修改 JSON。
+- 状态文件：`AstrBot/data/plugin_data/astrbot_plugin_autonomous_attention/attention_state.json`。
+- 默认 INFO 日志记录会话、决策、稳定原因码和简短理由，不记录完整聊天内容、人格或完整提示词。
+- 判断记录包含 `umo/interest_id/checkpoint_id/anchor_message_id/wake_source`、消息进度、模型建议、代码决定、拒绝码、预留 ID 和发送结果。
+- 汇总使用持久化累计计数，区分外部消息、语义判断、建议参与、获批尝试、被动放行和主动成功发送，不受最近日志条数限制。明确生成失败、明确发送失败与发送结果不明分别记录；平台超时或未知异常不自动重试。
+- 工具调用返回结果不会进入兴趣模型 prompt；`build_passive_request` 会过滤 `role=tool`、工具协议消息和工具结果内容块。
+- 群聊内容始终作为不可信数据传入提示词，系统提示明确要求不要执行其中指令。
 
 ## 目录结构
 
 ```text
-main.py                 插件入口、事件处理、管理指令
-astrbot_adapter.py      唯一的 AstrBot 适配层
+main.py                 插件入口、事件钩子、工具与管理指令
+astrbot_adapter.py      唯一的 AstrBot 适配层：唤醒分类、上下文过滤、发送
 attention/
-  control.py            统一控制层：权限、优先级、时限、主 Agent 意图
-  engine.py             会话协调、状态转移、发送与预算
-  passive.py            单轮被动决策
+  control.py            统一控制层：会话所有权、兴趣/检查点/机会、参与许可
+  engine.py             被动/主动协调、消息进度、配额、恢复与审计
+  passive.py            单轮被动建议
   active.py             受限主动 Agent 循环
   scheduler.py          检查点调度与任务生命周期
-  policy.py             硬性策略、冷却、预算、静默时段
-  store.py              JSON 状态存储
-  models.py             领域对象、来源与优先级常量
-  prompts.py            两套评判提示词与上下文格式化
-  validation.py         JSON 提取与结构校验
-  settings.py           配置快照与边界
-tests/                  使用 AstrBot logger facade 的核心逻辑测试
+  policy.py             硬策略、预算、冷却、静默时段
+  store.py              v2 JSON 状态、v1 迁移与原子写入
+  models.py             领域对象、来源、唤醒来源、状态常量
+  prompts.py            两套提示词、带消息 ID 的窗口格式化
+  validation.py         JSON 提取、建议结构与动作校验
+  settings.py           配置快照、边界与旧键映射
+tests/                  核心回归、迁移、隔离与适配层测试
 ```
 
-核心包只从 `astrbot.api` 导入官方 `logger` 以满足平台日志规范；其余平台能力仍通过适配层注入，不把 `AstrMessageEvent`、消息链或平台 API 传入核心。
+## 测试
+
+```bash
+python -m pytest -q
+```
+
+核心测试使用 FakeGateway/FakeContextProvider/FakeSender，不依赖真实模型或等待。适配层测试在 AstrBot 未安装时自动跳过。
 
 ## 已知边界
 
-- 主动检查依赖群消息窗口。插件会观察 `group_allowlist` 内群聊的消息，并把窗口随状态一起持久化；若 AstrBot 自身的群聊历史功能关闭，重启前的部分未持久化消息可能缺失。
-- 第三方 Agent Runner（Dify/Coze 等）的 `ProviderRequest` 可能不包含完整 contexts；此时被动决策使用可获得的 prompt 与 system prompt。
-- `end_focus` 会完成检查点；之后需要重新创建检查点才会继续主动关注。
-- `group_allowlist` 为空时不会允许任何群聊被观察、建立检查点或接收主动消息；私聊被动判断不受影响。生产环境需要显式配置允许的群。
-- 不在 `group_allowlist` 内的群不会被本插件观察或主动检查；其被动消息直接按 AstrBot 原有流程处理（用户忽略等硬性策略仍可能生效）。
-- 主模型工具依赖当前 Provider 的 Function Calling 支持，以及 AstrBot 人格/工具配置允许这些工具；不支持工具调用的模型仍可正常使用被动/主动注意力，只是不能主动查询或下达意图。
-- 主 Agent 意图和用户策略按来源优先级仲裁：管理员 > 主 Agent > 注意力 Agent > 默认策略。旧状态文件会在加载时自动补齐 `source`、`priority`、`directive_id` 等字段。
+- 主动检查依赖群消息窗口；插件会观察白名单群消息并随状态持久化。AstrBot 自身群历史关闭时，重启前未持久化的部分可能缺失。
+- AstrBot 在部分版本会在普通用户请求上也写入 `provider_request` extra；被动门使用 `on_waiting_llm_request` 的时间点区分插件构造请求与普通用户请求，并显式跳过 `cron` 合成事件。
+- 唤醒前缀可能被 AstrBot 在钩子前裁剪；来源分类同时检查原始平台消息、At/Reply 组件和配置前缀，无法确认时使用 `unknown` 保守处理。
+- 主动参与只在群聊生效；私聊仅支持被动判断和兴趣状态。
+- 第三方 Agent Runner 的 `ProviderRequest` 可能缺少完整 contexts；此时被动建议使用可获得的消息与 prompt。
+- 主模型工具依赖 Provider 的 Function Calling 支持；不支持工具时被动/主动仍可工作，只是主模型无法查询或下达意图。

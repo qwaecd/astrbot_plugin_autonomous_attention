@@ -23,10 +23,11 @@ from .astrbot_adapter import (
     AstrBotMessageSender,
     AstrBotModelGateway,
     build_passive_request,
+    classify_wake_source,
 )
 from .attention import AttentionEngine, Settings, StateStore
 from .attention.control import Actor
-from .attention.models import SOURCE_MAIN_AGENT
+from .attention.models import EXPLICIT_WAKE_SOURCES, SOURCE_MAIN_AGENT
 from .attention.timeutil import to_iso
 from .attention.validation import clip_text
 
@@ -43,16 +44,17 @@ class AdminOnlyFilter(filter.CustomFilter):
 
 
 HELP_TEXT = """Autonomous Attention 管理指令：
-/attention status — 查看运行状态、预算和最近决策
-/attention list — 列出检查点
-/attention add [分钟] [原因] — 为当前群创建检查点
+/attention status [UMO|--all] — 查看当前会话/全局状态、兴趣和最近决策
+/attention list [UMO|--all] — 列出当前会话/全局检查点
+/attention interests [UMO|--all] — 列出当前会话/全局兴趣
+/attention add [分钟] [原因] — 为当前群创建扫描检查点
 /attention add <UMO> [分钟] [原因] — 为指定群创建检查点
 /attention check <检查点ID> — 立即执行一次检查
-/attention pause|resume|remove <检查点ID> — 暂停/恢复/取消
+/attention pause|resume|remove <检查点ID> [UMO] — 暂停/恢复/取消
 /attention ignore <用户ID或@成员> [时长] [原因] — 设置忽略策略
 /attention unignore <用户ID或@成员> — 解除当前群忽略策略
 /attention policies — 列出忽略策略
-/attention budget — 查看当天预算
+/attention budget [UMO|--all] — 查看当天预算
 /attention dryrun on|off — 切换 dry-run
 /attention help — 显示本帮助
 时长示例：30m、2h、1d、永久；省略时默认 60 分钟。"""
@@ -60,6 +62,9 @@ HELP_TEXT = """Autonomous Attention 管理指令：
 
 class AutonomousAttentionPlugin(Star):
     """Wire the platform-independent attention core into AstrBot."""
+
+    _wake_prefixes: tuple[str, ...] = ()
+    _friend_needs_wake_prefix = False
 
     def __init__(
         self,
@@ -76,11 +81,32 @@ class AutonomousAttentionPlugin(Star):
         self._fallback_timezone = str(
             self.context.get_config().get("timezone") or "",
         )
+        self._wake_prefixes: tuple[str, ...] = ()
+        self._friend_needs_wake_prefix = False
+        self._refresh_wake_metadata()
         self.settings = Settings.from_mapping(
             self.config,
             self._fallback_timezone,
         )
         self._apply_log_level()
+
+    def _refresh_wake_metadata(self) -> None:
+        """Cache the AstrBot wake settings used to classify request sources."""
+
+        try:
+            config = self.context.get_config()
+        except Exception:
+            config = {}
+        prefixes = config.get("wake_prefix") or []
+        if isinstance(prefixes, str):
+            prefixes = [prefixes]
+        self._wake_prefixes = tuple(str(item) for item in prefixes if str(item).strip())
+        platform_settings = config.get("platform_settings") or {}
+        self._friend_needs_wake_prefix = bool(
+            platform_settings.get("friend_message_needs_wake_prefix", False)
+            if isinstance(platform_settings, dict)
+            else False
+        )
 
     def _apply_log_level(self) -> None:
         try:
@@ -140,6 +166,7 @@ class AutonomousAttentionPlugin(Star):
         logger.info("Autonomous Attention terminated.")
 
     def _reload_settings(self) -> None:
+        self._refresh_wake_metadata()
         self.settings = Settings.from_mapping(
             self.config,
             self._fallback_timezone,
@@ -219,7 +246,7 @@ class AutonomousAttentionPlugin(Star):
                 )
             return
 
-        if not group_id or not self.settings.active_enabled:
+        if not group_id:
             return
         if self._is_command_event(event):
             return
@@ -270,30 +297,44 @@ class AutonomousAttentionPlugin(Star):
         if event.get_extra("_aa_passive_handled"):
             return
         event.set_extra("_aa_passive_handled", True)
+        wake_source = classify_wake_source(event, self._wake_prefixes)
         try:
             request_obj = build_passive_request(
                 event,
                 request,
                 is_command=self._is_command_event(event),
                 timestamp=to_iso(self.engine.policy.now()),
+                wake_prefixes=self._wake_prefixes,
+                friend_needs_wake_prefix=self._friend_needs_wake_prefix,
             )
             outcome = await self.engine.handle_passive(request_obj)
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Passive attention gate failed; passing through.")
+            logger.exception("Passive attention gate failed.")
+            if wake_source not in EXPLICIT_WAKE_SOURCES:
+                # Autonomous requests must not fail open.
+                try:
+                    event.stop_event()
+                    event.set_extra("_aa_blocked", True)
+                except Exception:
+                    pass
             return
         if outcome.block:
             event.stop_event()
             event.set_extra("_aa_blocked", True)
             logger.info(
                 "Passive attention blocked main model: umo=%s user=%s "
-                "decision=%s reason=%s",
+                "decision=%s code=%s reason=%s",
                 event.unified_msg_origin,
                 event.get_sender_id(),
                 outcome.decision,
+                outcome.code or "-",
                 clip_text(outcome.reason, 100),
             )
+        elif outcome.reservation_id:
+            event.set_extra("_aa_passive_reservation", outcome.reservation_id)
+            event.set_extra("_aa_passive_umo", request_obj.umo)
 
     @filter.on_llm_response()
     async def remember_bot_reply(
@@ -303,7 +344,19 @@ class AutonomousAttentionPlugin(Star):
     ) -> None:
         """Add the bot's own reply to the active sliding window."""
 
-        if not self._ready or self.engine is None or not event.get_group_id():
+        if not self._ready or self.engine is None:
+            return
+        reservation_id = str(event.get_extra("_aa_passive_reservation") or "")
+        if reservation_id:
+            try:
+                await self.engine.complete_passive_generation(
+                    str(event.get_extra("_aa_passive_umo") or event.unified_msg_origin),
+                    reservation_id,
+                    str(getattr(response, "completion_text", "") or ""),
+                )
+            except Exception:
+                logger.exception("Failed to complete passive participation.")
+        if not event.get_group_id():
             return
         if not self.settings.active_enabled:
             return
@@ -393,15 +446,13 @@ class AutonomousAttentionPlugin(Star):
         self,
         event: AstrMessageEvent,
         scope: str = "session",
-        target_user: str = "",
     ) -> str:
         """查询当前会话范围内的注意力状态摘要。
 
-        后台注意力 Agent 是执行单元。仅在用户提及相关状态、需要解释 Bot 行为或需要基于注意力状态作决定时调用。只返回请求范围内的紧凑摘要，不返回聊天历史和完整状态文件。
+        后台注意力 Agent 是执行单元。仅在用户提及相关状态、需要解释 Bot 行为或需要基于注意力状态作决定时调用。只返回当前会话的紧凑摘要，`all` 表示当前会话内全部类别，不返回其他会话、聊天历史或完整状态文件。
 
         Args:
-            scope(string): session、user、group、directives、recent 或 all。
-            target_user(string): 可选目标用户 ID，仅 scope=user 或 all 时使用；普通成员只能查询自己。
+            scope(string): session、interests、checkpoints、directives、recent 或 all。
         """
         error = self._tools_ready(event)
         if error:
@@ -410,7 +461,6 @@ class AutonomousAttentionPlugin(Star):
             result = await self.engine.control.query(
                 self._tool_actor(event),
                 scope=scope,
-                target_user=target_user,
             )
         except Exception as exc:
             return self._tool_failure("query_failed", str(exc))
@@ -425,17 +475,19 @@ class AutonomousAttentionPlugin(Star):
         reason: str = "",
         expires_in_minutes: int = 0,
         minutes: int = 0,
+        interest_id: str = "",
     ) -> str:
         """表达主 Agent 的关注或停止关注意图。
 
-        注意力 Agent 会在后台执行这些意图，但不能覆盖它们。不要假设意图已经存在，必须以返回结果为准。
+        关注意图只会提高本会话兴趣的优先级，不能绕过证据和参与许可。注意力 Agent 在后台执行，但不能覆盖管理员的硬性策略。不要假设意图已经存在，必须以返回结果为准。
 
         Args:
             intent_type(string): focus_group、focus_topic、ignore_user、stop_focus 或 schedule_check。
-            target(string): 目标群号、UMO、话题关键字或用户 ID；为空时使用当前会话。
+            target(string): 话题关键字或用户 ID；为空时使用当前会话。
             reason(string): 简短原因。
-            expires_in_minutes(number): 意图有效分钟数；0 表示使用默认时限。普通成员受自动时限限制。
+            expires_in_minutes(number): 意图有效分钟数；0 表示使用默认时限。
             minutes(number): schedule_check 的延迟分钟数。
+            interest_id(string): schedule_check 可选关联的本会话兴趣 ID。
         """
         error = self._tools_ready(event) or self._group_tool_blocked(event)
         if error:
@@ -448,6 +500,7 @@ class AutonomousAttentionPlugin(Star):
                 reason=reason,
                 expires_in_minutes=expires_in_minutes or None,
                 minutes=minutes or None,
+                interest_id=interest_id,
             )
         except Exception as exc:
             return self._tool_failure("set_intent_failed", str(exc))
@@ -590,34 +643,68 @@ class AutonomousAttentionPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @attention_group.command("status", alias={"状态"})
     async def command_status(self, event: AstrMessageEvent):
-        """查看插件状态和最近决策。"""
+        """查看当前会话或全局的运行状态。"""
         if not self._ready or self.engine is None:
             yield event.plain_result(
                 "Autonomous Attention 尚未初始化成功，请检查日志。"
             )
             return
-        snapshot = await self.engine.status_snapshot()
+        args = self._command_args(event)
+        global_scope = any(item == "--all" for item in args)
+        target_umo = ""
+        if not global_scope:
+            target_umo = next(
+                (item for item in args if ":" in item),
+                event.unified_msg_origin,
+            )
+        snapshot = await self.engine.status_snapshot(target_umo)
         counts = snapshot.get("checkpoint_counts") or {}
         count_text = "、".join(f"{key}={value}" for key, value in counts.items())
         scheduler = snapshot.get("scheduler") or {}
         lines = [
             "Autonomous Attention 状态",
+            f"范围：{snapshot.get('scope')}",
             f"被动模式：{snapshot.get('passive_mode')}",
             f"主动检查：{'开启' if snapshot.get('active_enabled') else '关闭'}",
             f"dry-run：{'开启' if snapshot.get('dry_run') else '关闭'}",
             f"检查点：{count_text or '无'}",
+            f"兴趣：{snapshot.get('interest_count', 0)} 个；"
+            f"待用参与机会：{snapshot.get('opportunity_count', 0)} 个",
             f"忽略策略：{snapshot.get('policy_count', 0)} 条",
             f"预算：{snapshot.get('budget')}",
             f"调度器：{'运行中' if scheduler.get('running') else '已停止'}，"
             f"活动任务 {scheduler.get('active_tasks', 0)} 个",
         ]
+        if snapshot.get("migrated"):
+            lines.append("状态已从 v1 迁移到 v2。")
+        metrics = snapshot.get("metrics") or {}
+        if metrics:
+            lines.append(
+                "指标：收到 {received} / 语义判断 {semantic} / 建议 {suggestions} / "
+                "获批 {approved} / 被动放行 {passive} / 主动发送 {sent} / "
+                "显式放行 {explicit}".format(
+                    received=metrics.get("received_messages", 0),
+                    semantic=metrics.get("semantic_decisions", 0),
+                    suggestions=metrics.get("suggestions", 0),
+                    approved=metrics.get("approved_reservations", 0),
+                    passive=metrics.get("passive_passes", 0),
+                    sent=metrics.get("active_sends", 0),
+                    explicit=metrics.get("explicit_passes", 0),
+                )
+            )
+            rejection = metrics.get("rejection_counts") or {}
+            if rejection:
+                top = sorted(rejection.items(), key=lambda item: -item[1])[:3]
+                lines.append(
+                    "拒绝原因：" + "、".join(f"{key}={value}" for key, value in top)
+                )
         recent = snapshot.get("recent_decisions") or []
         if recent:
             lines.append("最近决策：")
             for item in recent[-3:]:
                 lines.append(
                     f"- {item.get('timestamp', '')} [{item.get('kind')}] "
-                    f"{item.get('decision')} / {item.get('interest')} "
+                    f"{item.get('decision')} / {item.get('code') or '-'} "
                     f"{clip_text(item.get('reason'), 60)}"
                 )
         yield event.plain_result("\n".join(lines))
@@ -625,20 +712,32 @@ class AutonomousAttentionPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @attention_group.command("list", alias={"列表"})
     async def command_list(self, event: AstrMessageEvent):
-        """列出检查点。"""
+        """列出当前会话或全局的检查点。"""
         if not self._ready or self.engine is None:
             yield event.plain_result("插件尚未初始化。")
             return
-        items = await self.engine.list_checkpoints()
+        args = self._command_args(event)
+        global_scope = any(item == "--all" for item in args)
+        target_umo = ""
+        if not global_scope:
+            target_umo = next(
+                (item for item in args if ":" in item),
+                event.unified_msg_origin,
+            )
+        items = await self.engine.list_checkpoints(target_umo)
         if not items:
-            yield event.plain_result("当前没有检查点。使用 /attention add 创建。")
+            yield event.plain_result(
+                "当前没有检查点。使用 /attention add 创建，"
+                "或让主 Agent 调用 schedule_check。"
+            )
             return
-        lines = ["检查点列表："]
-        for item in items[:20]:
+        lines = [f"检查点列表（{target_umo or '全部会话'}）："]
+        for item in items[:30]:
             lines.append(
                 f"- {item.get('checkpoint_id')} | {item.get('status')} | "
                 f"{self._short_time(item.get('scheduled_at'))} | "
-                f"群 {item.get('group_id') or '-'} | "
+                f"{item.get('kind') or 'session_scan'} | "
+                f"兴趣 {item.get('interest_id') or '-'} | "
                 f"{clip_text(item.get('reason'), 50)}"
             )
             if item.get("last_result"):
@@ -646,6 +745,37 @@ class AutonomousAttentionPlugin(Star):
                     f"  上次：{item.get('last_result')} "
                     f"{clip_text(item.get('last_error'), 50)}"
                 )
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @attention_group.command("interests", alias={"兴趣"})
+    async def command_interests(self, event: AstrMessageEvent):
+        """列出当前会话或全局的兴趣。"""
+        if not self._ready or self.engine is None:
+            yield event.plain_result("插件尚未初始化。")
+            return
+        args = self._command_args(event)
+        global_scope = any(item == "--all" for item in args)
+        target_umo = ""
+        if not global_scope:
+            target_umo = next(
+                (item for item in args if ":" in item),
+                event.unified_msg_origin,
+            )
+        items = await self.engine.list_interests(target_umo)
+        if not items:
+            yield event.plain_result("当前没有兴趣。")
+            return
+        lines = [f"兴趣列表（{target_umo or '全部会话'}）："]
+        for item in items[:30]:
+            lines.append(
+                f"- {item.get('interest_id')} | {item.get('status')} | "
+                f"{clip_text(item.get('summary'), 60)} | 等待 "
+                f"{clip_text(item.get('wait_for'), 40) or '-'} | 剩余检查 "
+                f"{item.get('remaining_checks')} | 无进展 "
+                f"{item.get('no_progress_count')} | 到期 "
+                f"{self._short_time(item.get('expires_at')) or '-'}"
+            )
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -673,7 +803,7 @@ class AutonomousAttentionPlugin(Star):
         try:
             checkpoint = await self.engine.create_checkpoint(
                 umo=target_umo,
-                platform_id=event.get_platform_id(),
+                platform_id="" if umo else event.get_platform_id(),
                 group_id="" if umo else event.get_group_id(),
                 minutes=minutes,
                 reason=reason,
@@ -698,9 +828,16 @@ class AutonomousAttentionPlugin(Star):
             return
         args = self._command_args(event)
         if not args:
-            yield event.plain_result("用法：/attention check <检查点ID>")
+            yield event.plain_result("用法：/attention check <检查点ID> [UMO]")
             return
-        ok, message = await self.engine.trigger_checkpoint(args[0])
+        target_umo = next(
+            (item for item in args[1:] if ":" in item),
+            event.unified_msg_origin,
+        )
+        ok, message = await self.engine.trigger_checkpoint(
+            args[0],
+            umo=target_umo,
+        )
         yield event.plain_result(
             f"已触发检查：{args[0]}" if ok else f"无法触发：{message}"
         )
@@ -826,7 +963,15 @@ class AutonomousAttentionPlugin(Star):
         if not self._ready or self.engine is None:
             yield event.plain_result("插件尚未初始化。")
             return
-        snapshot = await self.engine.status_snapshot()
+        args = self._command_args(event)
+        global_scope = any(item == "--all" for item in args)
+        target_umo = ""
+        if not global_scope:
+            target_umo = next(
+                (item for item in args if ":" in item),
+                event.unified_msg_origin,
+            )
+        snapshot = await self.engine.status_snapshot(target_umo)
         yield event.plain_result(str(snapshot.get("budget") or "无预算信息"))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -868,11 +1013,21 @@ class AutonomousAttentionPlugin(Star):
         if not args:
             yield event.plain_result("请提供检查点 ID。")
             return
-        ok, detail = await self.engine.set_checkpoint_status(args[0], status)
+        target_umo = next(
+            (item for item in args[1:] if ":" in item),
+            event.unified_msg_origin,
+        )
+        ok, detail = await self.engine.set_checkpoint_status(
+            args[0],
+            status,
+            umo=target_umo,
+        )
         if not ok:
             yield event.plain_result(f"操作失败：{detail}")
             return
-        yield event.plain_result(f"{label}检查点 {args[0]}（当前状态：{detail}）。")
+        yield event.plain_result(
+            f"{label}检查点 {args[0]}（UMO：{target_umo}，状态：{detail}）。"
+        )
 
     # ------------------------------------------------------------------
     # Small helpers

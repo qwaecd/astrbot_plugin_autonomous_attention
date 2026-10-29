@@ -128,17 +128,37 @@ async def test_message_sender_calls_context() -> None:
     assert context.sent[0][0] == "p:GroupMessage:g"
 
 
-def test_build_passive_request_from_event() -> None:
-    event = SimpleNamespace(
-        unified_msg_origin="p:GroupMessage:g",
-        message_obj=SimpleNamespace(message_id="m1"),
-        message_str="你好",
+def _event(
+    *,
+    umo: str = "p:GroupMessage:g",
+    group_id: str = "g",
+    message_str: str = "你好",
+    message_id: str = "m1",
+    messages: list | None = None,
+    self_id: str = "bot",
+    raw_message: dict | None = None,
+    is_admin: bool = False,
+):
+    return SimpleNamespace(
+        unified_msg_origin=umo,
+        message_obj=SimpleNamespace(
+            message_id=message_id,
+            raw_message=raw_message,
+        ),
+        message_str=message_str,
         get_platform_id=lambda: "p",
-        get_group_id=lambda: "g",
+        get_group_id=lambda: group_id,
         get_sender_id=lambda: "u1",
         get_sender_name=lambda: "用户",
-        is_admin=lambda: False,
+        get_self_id=lambda: self_id,
+        get_messages=lambda: list(messages or []),
+        is_at_or_wake_command=True,
+        is_admin=lambda: is_admin,
     )
+
+
+def test_build_passive_request_from_event() -> None:
+    event = _event()
     request = SimpleNamespace(
         system_prompt="sys",
         contexts=[{"role": "user", "content": "hi"}],
@@ -154,19 +174,61 @@ def test_build_passive_request_from_event() -> None:
     assert passive.group_id == "g"
     assert passive.contexts[0]["content"] == "hi"
     assert passive.timestamp.startswith("2026-01-01")
+    assert passive.wake_source == "unknown"
+
+
+def test_build_passive_request_classifies_wake_sources() -> None:
+    from astrbot.api.message_components import At, Plain, Reply
+
+    reply = Reply(
+        id="x",
+        chain=[],
+        sender_id="123",
+        sender_nickname="bot",
+        time=0,
+        message_str="旧消息",
+        text="旧消息",
+        qq=123,
+    )
+    at = At(qq=123)
+    cases = [
+        (_event(group_id="", umo="p:FriendMessage:u1"), (), "private"),
+        (
+            _event(messages=[at], self_id="123"),
+            (),
+            "mention",
+        ),
+        (
+            _event(messages=[reply], self_id="123"),
+            (),
+            "reply_to_bot",
+        ),
+        (
+            _event(
+                message_str="dev 你好",
+                raw_message={
+                    "message": [{"type": "text", "data": {"text": "/dev 你好"}}]
+                },
+            ),
+            ("/dev",),
+            "wake_prefix",
+        ),
+        (_event(messages=[Plain("你好")]), (), "unknown"),
+    ]
+    for event, prefixes, expected in cases:
+        request = SimpleNamespace(system_prompt="", contexts=[], prompt="你好")
+        passive = build_passive_request(
+            event,
+            request,
+            is_command=False,
+            timestamp="2026-01-01T00:00:00+08:00",
+            wake_prefixes=prefixes,
+        )
+        assert passive.wake_source == expected, (passive.wake_source, expected)
 
 
 def test_build_passive_request_filters_tool_contexts() -> None:
-    event = SimpleNamespace(
-        unified_msg_origin="p:GroupMessage:g",
-        message_obj=SimpleNamespace(message_id="m1"),
-        message_str="你好",
-        get_platform_id=lambda: "p",
-        get_group_id=lambda: "g",
-        get_sender_id=lambda: "u1",
-        get_sender_name=lambda: "用户",
-        is_admin=lambda: False,
-    )
+    event = _event()
     request = SimpleNamespace(
         system_prompt="sys",
         contexts=[
@@ -226,7 +288,7 @@ async def test_passive_gate_accepts_user_request_after_provider_request_is_set()
 
     async def handle_passive(request):
         calls.append(request)
-        return SimpleNamespace(block=False)
+        return SimpleNamespace(block=False, reservation_id="", code="", reason="")
 
     plugin.engine = SimpleNamespace(
         policy=SimpleNamespace(now=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc)),
@@ -236,9 +298,14 @@ async def test_passive_gate_accepts_user_request_after_provider_request_is_set()
     event = SimpleNamespace(
         is_at_or_wake_command=True,
         message_str="你好",
+        unified_msg_origin="p:GroupMessage:g",
         get_extra=lambda key, default=None: extras.get(key, default),
         set_extra=lambda key, value: extras.__setitem__(key, value),
         get_platform_name=lambda: "aiocqhttp",
+        get_group_id=lambda: "g",
+        get_sender_id=lambda: "u1",
+        get_self_id=lambda: "bot",
+        get_messages=lambda: [],
     )
 
     original_builder = main_module.build_passive_request
@@ -311,6 +378,104 @@ async def test_plugin_initialize_and_terminate(tmp_path, monkeypatch) -> None:
     assert plugin.engine.scheduler.status()["running"] is False
 
 
+@pytest.mark.asyncio
+async def test_plugin_private_passive_gate_is_direct(tmp_path, monkeypatch) -> None:
+    from astrbot.core.star.star_tools import StarTools
+
+    monkeypatch.setattr(
+        StarTools, "get_data_dir", classmethod(lambda cls, name: tmp_path)
+    )
+    context = FakeContext()
+    context.get_config = lambda: {
+        "timezone": "Asia/Shanghai",
+        "wake_prefix": ["/"],
+        "platform_settings": {"friend_message_needs_wake_prefix": True},
+    }
+    plugin = AutonomousAttentionPlugin(
+        context,
+        {"passive_mode": "full", "group_allowlist": []},
+    )
+    await plugin.initialize()
+    extras: dict = {}
+    event = SimpleNamespace(
+        unified_msg_origin="p:FriendMessage:u1",
+        message_str="你好",
+        message_obj=SimpleNamespace(message_id="m1", raw_message=None),
+        is_at_or_wake_command=True,
+        get_platform_name=lambda: "aiocqhttp",
+        get_platform_id=lambda: "p",
+        get_group_id=lambda: "",
+        get_sender_id=lambda: "u1",
+        get_sender_name=lambda: "用户",
+        get_self_id=lambda: "bot",
+        get_messages=lambda: [],
+        is_admin=lambda: False,
+        get_extra=lambda key, default=None: extras.get(key, default),
+        set_extra=lambda key, value: extras.__setitem__(key, value),
+        stop_event=lambda: extras.__setitem__("_stopped", True),
+    )
+    request = SimpleNamespace(system_prompt="", contexts=[], prompt="你好")
+    try:
+        await plugin.passive_gate(event, request)
+        assert extras.get("_stopped") is None
+        decisions = plugin.engine.store.state["decisions"]
+        assert decisions[-1]["code_decision"] == "explicit_pass"
+        assert decisions[-1]["wake_source"] == "private"
+        assert context.calls == []
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_plugin_group_autonomous_gate_observes_on_invalid_model(
+    tmp_path, monkeypatch
+) -> None:
+    from astrbot.api.message_components import Plain
+    from astrbot.core.star.star_tools import StarTools
+
+    monkeypatch.setattr(
+        StarTools, "get_data_dir", classmethod(lambda cls, name: tmp_path)
+    )
+    context = FakeContext()
+    context.get_config = lambda: {
+        "timezone": "Asia/Shanghai",
+        "wake_prefix": ["/"],
+        "platform_settings": {"friend_message_needs_wake_prefix": True},
+    }
+    plugin = AutonomousAttentionPlugin(
+        context,
+        {"passive_mode": "full", "group_allowlist": ["g"]},
+    )
+    await plugin.initialize()
+    extras: dict = {}
+    event = SimpleNamespace(
+        unified_msg_origin="p:GroupMessage:g",
+        message_str="插件怎么配置",
+        message_obj=SimpleNamespace(message_id="m1", raw_message=None),
+        is_at_or_wake_command=True,
+        get_platform_name=lambda: "aiocqhttp",
+        get_platform_id=lambda: "p",
+        get_group_id=lambda: "g",
+        get_sender_id=lambda: "u1",
+        get_sender_name=lambda: "用户",
+        get_self_id=lambda: "bot",
+        get_messages=lambda: [Plain("插件怎么配置")],
+        is_admin=lambda: False,
+        get_extra=lambda key, default=None: extras.get(key, default),
+        set_extra=lambda key, value: extras.__setitem__(key, value),
+        stop_event=lambda: extras.__setitem__("_stopped", True),
+    )
+    request = SimpleNamespace(system_prompt="", contexts=[], prompt="插件怎么配置")
+    try:
+        await plugin.passive_gate(event, request)
+        assert extras.get("_stopped") is True
+        decisions = plugin.engine.store.state["decisions"]
+        assert decisions[-1]["rejection_code"] in {"invalid_output", "model_error"}
+        assert len(context.calls) == 1
+    finally:
+        await plugin.terminate()
+
+
 def _tool_event(is_admin: bool = False):
     return SimpleNamespace(
         unified_msg_origin="p:GroupMessage:g",
@@ -320,6 +485,21 @@ def _tool_event(is_admin: bool = False):
         get_sender_name=lambda: "用户",
         is_admin=lambda: is_admin,
     )
+
+
+def test_metadata_declares_qq_platforms() -> None:
+    import yaml
+
+    metadata = yaml.safe_load(
+        (Path(__file__).resolve().parent.parent / "metadata.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["support_platforms"] == [
+        "aiocqhttp",
+        "qq_official",
+        "qq_official_webhook",
+    ]
 
 
 def test_main_agent_attention_tools_registered() -> None:
@@ -342,17 +522,21 @@ def test_config_schema_is_grouped_and_loads_nested_defaults(tmp_path) -> None:
 
     schema_path = Path(__file__).resolve().parent.parent / "_conf_schema.json"
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    assert set(schema) == {
+    visible_schema = {
+        key: node for key, node in schema.items() if not node.get("invisible")
+    }
+    assert set(visible_schema) == {
         "general",
         "models",
         "groups",
         "context",
         "scheduling",
         "agent_limits",
+        "attention_limits",
         "budgets",
         "safety",
     }
-    for node in schema.values():
+    for node in visible_schema.values():
         assert node["type"] == "object"
         assert isinstance(node.get("items"), dict) and node["items"]
 

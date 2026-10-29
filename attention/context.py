@@ -5,16 +5,6 @@ from __future__ import annotations
 from .models import RecentMessage
 
 
-def _dedupe_key(message: RecentMessage) -> tuple[str, int, str]:
-    if message.message_id:
-        return ("id", 0, message.message_id)
-    return (
-        "shape",
-        int(message.created_ts),
-        f"{message.sender_id}|{message.is_bot}|{message.text[:120]}",
-    )
-
-
 def merge_window(
     history: list[RecentMessage],
     recent: list[RecentMessage],
@@ -33,22 +23,36 @@ def merge_window(
 
     if limit <= 0:
         return []
-    merged: list[RecentMessage] = []
-    seen: set[tuple[str, int, str]] = set()
-    bot_signatures: dict[tuple[str, str], float] = {}
-    for message in [*history, *recent]:
-        key = _dedupe_key(message)
-        if key in seen:
+    # Prefer observed platform IDs and sequences over database row IDs. Only
+    # cross-source records may match by shape; equal live messages stay distinct.
+    merged = list(recent)
+    for message in history:
+        match = next(
+            (
+                item
+                for item in merged
+                if (
+                    message.message_id
+                    and message.message_id in [item.message_id, *item.aliases]
+                )
+                or (
+                    message.created_ts > 0
+                    and item.created_ts > 0
+                    and (message.source == "history" or item.source == "history")
+                    and item.sender_id == message.sender_id
+                    and item.is_bot == message.is_bot
+                    and item.text == message.text
+                    and abs(item.created_ts - message.created_ts) < 600
+                )
+            ),
+            None,
+        )
+        if match is not None:
+            if message.message_id != match.message_id:
+                match.aliases = list(
+                    dict.fromkeys([*match.aliases, message.message_id])
+                )[-10:]
             continue
-        if message.is_bot:
-            signature = (message.sender_id, message.text[:160])
-            previous = bot_signatures.get(signature)
-            if previous is not None and abs(message.created_ts - previous) < 120:
-                continue
-            bot_signatures[signature] = message.created_ts
-        seen.add(key)
         merged.append(message)
     merged.sort(key=lambda item: (item.created_ts, item.message_id))
-    if len(merged) > limit:
-        merged = merged[-limit:]
-    return merged
+    return merged[-limit:]

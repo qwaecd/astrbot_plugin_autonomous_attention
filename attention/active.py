@@ -1,4 +1,9 @@
-"""Bounded active attention loop with validated tool actions."""
+"""Bounded active attention loop with validated tool actions.
+
+The runner only produces a suggestion plus policy/checkpoint effects. The engine
+validates and applies them under the store lock, and the control layer decides
+whether participation is approved.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +13,6 @@ from typing import Any
 from .models import ActiveAction, ActiveContext, ActiveResult
 from .ports import ModelGateway
 from .prompts import (
-    build_active_reply_prompt,
     build_active_system_prompt,
     build_active_tool_result_prompt,
     build_active_user_prompt,
@@ -25,12 +29,7 @@ from .validation import (
 
 
 class ActiveAttentionRunner:
-    """Run one bounded active attention session.
-
-    The runner only produces a result and a list of policy/checkpoint effects.
-    The engine validates and applies those effects while holding the store lock,
-    which keeps the runner free of persistence concerns.
-    """
+    """Run one bounded active attention session."""
 
     def __init__(
         self,
@@ -52,8 +51,8 @@ class ActiveAttentionRunner:
         """Run the loop until a final action, a quota, or an error.
 
         Args:
-            ctx: Checkpoint, topic, window, persona and policy snapshot.
-            consume_call: Async budget check/reservation callback.
+            ctx: Checkpoint, session interests, window, persona and policies.
+            consume_call: Async global gateway budget callback.
             window_loader: Async loader used by the ``read_messages`` tool.
 
         Returns:
@@ -114,17 +113,33 @@ class ActiveAttentionRunner:
                 )
                 continue
             invalid_outputs = 0
+            assessed = action.arguments.get("evaluated_interest_ids")
+            if isinstance(assessed, list):
+                visible = {item.get("interest_id") for item in ctx.interests}
+                result.evaluated_interest_ids = [
+                    str(item)
+                    for item in assessed
+                    if isinstance(item, str) and item in visible
+                ]
 
             result.reason = action.reason or result.reason
             if action.interest_level:
                 result.interest_level = action.interest_level
-            if action.topic_summary:
-                result.topic_summary = action.topic_summary
-            if action.topic_status:
-                result.topic_status = action.topic_status
+            if action.interest_update:
+                result.interest_update = action.interest_update
 
             if action.action in {"participate", "request_main_reply"}:
                 result.decision = "participate"
+                result.opportunity = dict(action.opportunity or {})
+                result.opportunity.setdefault(
+                    "interest_id",
+                    str(
+                        result.opportunity.get("interest_id")
+                        or action.arguments.get("interest_id")
+                        or (ctx.interest or {}).get("interest_id")
+                        or ""
+                    ),
+                )
                 result.reply_guidance = action.reply_guidance or clip_text(
                     action.arguments.get("guidance"), 500
                 )
@@ -136,7 +151,12 @@ class ActiveAttentionRunner:
                 if minutes is not None:
                     result.next_check_minutes = minutes
                 if action.action == "end_focus":
-                    result.topic_status = "closed"
+                    target = action.arguments.get("interest_id") or (
+                        ctx.interest or {}
+                    ).get("interest_id")
+                    result.effects.append(
+                        {"type": "end_focus", "interest_id": str(target or "")}
+                    )
                 return result
 
             if result.tool_calls >= self.settings.max_tool_calls:
@@ -150,6 +170,7 @@ class ActiveAttentionRunner:
                 "defer_check",
                 "create_checkpoint",
                 "update_user_policy",
+                "record_interest",
             }
             if is_mutation and mutations >= self.settings.max_checkpoint_mutations:
                 result.reason = "checkpoint mutation budget exhausted"
@@ -163,7 +184,6 @@ class ActiveAttentionRunner:
             )
             result.tool_calls += 1
             if tool_output is None:
-                # The action could not be executed with the supplied arguments.
                 result.reason = "invalid tool arguments"
                 result.decision = "observe"
                 return result
@@ -200,12 +220,7 @@ class ActiveAttentionRunner:
         return result
 
     def _trim_history(self, history: list[dict[str, Any]]) -> None:
-        """Keep the oldest prompt and newest tool turns under the budget.
-
-        The initial prompt contains the checkpoint and window and is retained.
-        Older assistant/tool-result pairs are dropped when the accumulated
-        history grows beyond twice ``context_max_chars``.
-        """
+        """Keep the oldest prompt and newest tool turns under the budget."""
 
         budget = max(2000, self.settings.context_max_chars * 2)
 
@@ -224,18 +239,7 @@ class ActiveAttentionRunner:
         result: ActiveResult,
         window_loader: Callable[[int], Awaitable[list]],
     ) -> str | tuple[str, list] | None:
-        """Execute one read-only or deferred tool action.
-
-        Args:
-            action: Validated model action.
-            ctx: Active session context.
-            result: Mutable result collecting effects and counters.
-            window_loader: Loader for refreshed message windows.
-
-        Returns:
-            Tool output text, ``(text, refreshed_window)`` for message reads, or
-            ``None`` when a mutation quota is exceeded.
-        """
+        """Execute one read-only or deferred tool action."""
 
         arguments = action.arguments
 
@@ -245,6 +249,9 @@ class ActiveAttentionRunner:
             window = await window_loader(limit)
             if not window:
                 return "没有读到新的消息。"
+            for message in window:
+                if int(message.seq or 0) > ctx.evaluated_seq:
+                    ctx.evaluated_seq = int(message.seq)
             return (
                 format_window(
                     window,
@@ -254,12 +261,26 @@ class ActiveAttentionRunner:
                 window,
             )
 
-        if action.action == "get_topic":
-            summary = clip_text(str(ctx.topic.get("summary") or ""), 500)
+        if action.action in {"get_interest", "get_topic"}:
+            interest_id = str(
+                arguments.get("interest_id")
+                or (ctx.interest or {}).get("interest_id")
+                or ""
+            )
+            selected = None
+            for item in ctx.interests:
+                if item.get("interest_id") == interest_id:
+                    selected = item
+                    break
+            if selected is None:
+                return "本会话没有该兴趣，或它已经关闭。"
             return (
-                f"话题摘要：{summary or '（无）'}\n"
-                f"兴趣：{ctx.topic.get('interest_level') or 'none'}\n"
-                f"关注状态：{ctx.topic.get('focus_status') or 'idle'}"
+                f"兴趣：{selected.get('interest_id')}\n"
+                f"摘要：{clip_text(selected.get('summary'), 300) or '（无）'}\n"
+                f"等待：{clip_text(selected.get('wait_for'), 200) or '（无）'}\n"
+                f"状态：{selected.get('status')}；剩余检查："
+                f"{selected.get('remaining_checks', 0)}；到期："
+                f"{selected.get('expires_at') or '-'}"
             )
 
         if action.action in {"schedule_next_check", "defer_check"}:
@@ -270,20 +291,27 @@ class ActiveAttentionRunner:
             return f"已记录下次检查间隔：{minutes} 分钟（受上下限约束）。"
 
         if action.action == "create_checkpoint":
+            interest_id = str(
+                arguments.get("interest_id")
+                or (ctx.interest or {}).get("interest_id")
+                or ""
+            )
             minutes = coerce_int(arguments.get("minutes"), 60) or 60
             reason = clip_text(
                 arguments.get("reason") or action.reason or "关注该话题",
                 200,
             )
-            effect = {
-                "type": "create_checkpoint",
-                "minutes": minutes,
-                "reason": reason,
-                "group_id": clip_text(arguments.get("group_id"), 80),
-                "umo": clip_text(arguments.get("umo"), 200),
-            }
-            result.effects.append(effect)
-            return "已创建新的检查点请求，将按策略校验后生效。"
+            if not interest_id:
+                return "缺少 interest_id；不能创建无主扫描器。"
+            result.effects.append(
+                {
+                    "type": "create_checkpoint",
+                    "interest_id": interest_id,
+                    "minutes": minutes,
+                    "reason": reason,
+                }
+            )
+            return "已记录检查点请求，将按兴趣期限和去重规则校验。"
 
         if action.action == "update_user_policy":
             user_id = clip_text(
@@ -294,20 +322,26 @@ class ActiveAttentionRunner:
                 return "缺少 user_id。"
             expires = coerce_int(arguments.get("expires_in_minutes"))
             if expires is not None:
-                expires = max(1, min(self.settings.max_auto_policy_hours * 60, expires))
-            effect = {
-                "type": "user_policy",
-                "scope": "user" if not ctx.checkpoint.get("group_id") else "group_user",
-                "group_id": str(ctx.checkpoint.get("group_id") or ""),
-                "user_id": user_id,
-                "expires_in_minutes": expires,
-                "reason": clip_text(
-                    arguments.get("reason") or action.reason or "策略调整",
-                    120,
-                ),
-            }
-            result.effects.append(effect)
-            return "已记录用户策略变更请求，将按策略校验后生效。"
+                expires = max(
+                    1,
+                    min(self.settings.max_auto_policy_hours * 60, expires),
+                )
+            result.effects.append(
+                {
+                    "type": "user_policy",
+                    "scope": "user"
+                    if not ctx.checkpoint.get("group_id")
+                    else "group_user",
+                    "group_id": str(ctx.checkpoint.get("group_id") or ""),
+                    "user_id": user_id,
+                    "expires_in_minutes": expires,
+                    "reason": clip_text(
+                        arguments.get("reason") or action.reason or "策略调整",
+                        120,
+                    ),
+                }
+            )
+            return "已记录用户策略变更请求，将按权限和时限校验。"
 
         if action.action == "record_interest":
             level = str(
@@ -315,19 +349,25 @@ class ActiveAttentionRunner:
             ).lower()
             if level in {"none", "low", "medium", "high"}:
                 result.interest_level = level
-                ctx.topic["interest_level"] = level
             summary = clip_text(
-                arguments.get("summary") or action.topic_summary,
-                500,
+                arguments.get("summary")
+                or (action.interest_update or {}).get("summary"),
+                300,
             )
-            if summary:
-                result.topic_summary = summary
-                ctx.topic["summary"] = summary
-            return "已记录兴趣和话题摘要。"
+            wait_for = clip_text(arguments.get("wait_for"), 300)
+            result.interest_update = {
+                "operation": "update",
+                "summary": summary,
+                "wait_for": wait_for,
+                "interest_id": str(
+                    arguments.get("interest_id")
+                    or (ctx.interest or {}).get("interest_id")
+                    or ""
+                ),
+                "evidence_message_ids": list(
+                    arguments.get("evidence_message_ids") or []
+                ),
+            }
+            return "已记录兴趣更新请求，仍需代码校验。"
 
         return None
-
-    def build_reply_prompt(self, ctx: ActiveContext, guidance: str) -> str:
-        """Build the final main-model prompt for a proactive reply."""
-
-        return build_active_reply_prompt(ctx, self.settings, guidance)
