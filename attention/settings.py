@@ -1,8 +1,7 @@
 """Typed, read-only plugin settings.
 
 AstrBot exposes plugin configuration as a mutable dictionary. The core consumes
-this snapshot instead, which makes defaults and bounds explicit and keeps tests
-free of AstrBot imports.
+this snapshot instead, which makes defaults and bounds explicit.
 
 The ``attention_limits`` group controls session resources. Legacy keys
 (``daily_active_message_budget`` and ``scheduling.group_send_cooldown_minutes``)
@@ -11,11 +10,12 @@ are still read when the new keys are absent so an upgrade keeps its old values.
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import tzinfo
 from typing import Any
+
+from astrbot.api import logger
 
 from .prompts import DEFAULT_ACTIVE_CRITERIA, DEFAULT_PASSIVE_CRITERIA
 from .timeutil import resolve_timezone
@@ -228,7 +228,7 @@ class Settings:
             old_value = _get(data, old_section, old_key)
             if old_value is not None and new_key not in _WARNED_COMPATIBILITY:
                 _WARNED_COMPATIBILITY.add(new_key)
-                logging.getLogger("astrbot").warning(
+                logger.warning(
                     "Attention config compatibility: %s inherits %s when absent or -1; "
                     "an explicit new value takes precedence.",
                     new_key,
