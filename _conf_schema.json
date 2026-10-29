@@ -455,16 +455,23 @@
         },
         "hint": "普通成员通过主模型工具创建忽略策略时受此时限约束；管理员仍可用管理指令创建更长期或永久策略。"
       },
-      "main_agent_max_intent_hours": {
-        "description": "主 Agent 意图默认/上限小时数",
+      "main_agent_max_intent_minutes": {
+        "description": "主 Agent 意图默认/上限分钟数",
         "type": "int",
-        "default": 24,
+        "default": 30,
         "slider": {
           "min": 1,
-          "max": 8760,
+          "max": 525600,
           "step": 1
         },
-        "hint": "关注、话题关注、停止关注和定时检查等主 Agent 意图的有效时间上限。"
+        "hint": "关注、话题关注、停止关注和定时检查等主 Agent 意图的有效时间上限；停止关注（stop_focus）也使用此时限。"
+      },
+      "main_agent_max_intent_hours": {
+        "description": "Legacy compatibility: main_agent_max_intent_hours",
+        "type": "int",
+        "default": -1,
+        "hint": "已迁移为 main_agent_max_intent_minutes；旧键仅在缺少新键时按小时换算为分钟。",
+        "invisible": true
       }
     }
   },

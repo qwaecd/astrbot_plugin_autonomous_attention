@@ -73,6 +73,13 @@ class AstrBotModelGateway:
                 clean_contexts.append({"role": str(role), "content": content})
 
         timeout_seconds = float(timeout or self.settings.decision_timeout_seconds)
+        if purpose == "decision":
+            logger.info(
+                "Attention decision model call: umo=%s provider=%s timeout=%ss",
+                umo,
+                provider_id or "-",
+                int(timeout_seconds),
+            )
         try:
             response = await asyncio.wait_for(
                 self.context.llm_generate(
@@ -308,7 +315,7 @@ def classify_wake_source(
         ``ambient`` or ``unknown``.
     """
 
-    if not event.get_group_id():
+    if not getattr(event, "get_group_id", lambda: "")():
         return "private"
     self_id = str(getattr(event, "get_self_id", lambda: "")() or "")
     messages = getattr(event, "get_messages", lambda: [])()

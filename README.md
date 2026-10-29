@@ -10,7 +10,7 @@
 - **参与机会（Opportunity）**：一次具体参与的证据锚点，必须引用本会话消息 ID、给出预计新增内容，并在有效期内未被消费。同一锚点跨主动/被动、换兴趣或换动作类型都只能获批一次。
 - **检查点（Checkpoint）**：调度记录，分 `interest`（绑定兴趣）和 `session_scan`（管理员/种子扫描）。同一会话同一兴趣只保留一个未结束检查点；同一会话最多一个扫描检查点。
 - **统一许可**：被动自主 `reply` 与主动 `participate` 都经过同一个控制合同：会话与硬策略 → 证据锚点 → 机会占用/过期 → 会话与全局自主配额 → 原子预留 → 生成/放行 → 提交结果。
-- **显式请求优先**：私聊、@Bot、引用 Bot、唤醒前缀视为显式请求；硬策略通过后直接放行主模型，不占用兴趣槽位和自主配额。`unknown` 来源按自主路径保守处理。
+- **直接放行与自主判断**：私聊与唤醒前缀视为直接请求，硬策略通过后直接放行主模型，不占用兴趣槽位和自主配额。群聊 @Bot、引用 Bot 与 `unknown` 来源一样交给兴趣模型判断，占用自主配额并需要证据锚点。
 - **关注不等于发言**：主 Agent 的 `focus_group` / `focus_topic` 只提高本会话兴趣优先级并记录证据，不再强制 `pass`；仍要经过证据和参与许可。
 
 ## 运行要求
@@ -37,14 +37,14 @@
 AstrBot 唤醒事件（私聊/@/引用/唤醒前缀）
   → 硬策略（用户忽略、白名单/黑名单、管理员覆盖）
   → 唤醒来源分类（private/mention/reply_to_bot/wake_prefix/unknown）
-  → 显式请求：直接放行主模型（不走兴趣模型、不占自主配额）
-  → 自主来源：会话节流 → 全局模型预算 → 兴趣模型一次
+  → 直接请求（private/wake_prefix）：直接放行主模型（不走兴趣模型、不占自主配额）
+  → 自主来源（mention/reply_to_bot/unknown）：会话节流 → 全局模型预算 → 兴趣模型一次
   → 机会证据校验 → 统一参与许可
   → pass（获批）或 observe/ignore（拒绝）
 ```
 
-- 显式请求：`private`、`mention`、`reply_to_bot`、`wake_prefix`。即使 `passive_mode=full` 也直接放行；`ignore_user` 等硬策略仍然优先。
-- 自主来源：`unknown`（无法确认来源，保守处理）或 `ambient`。没有新外部消息、未到最小评估间隔、配额不足或重复事件时直接 `observe`，不调用模型。
+- 直接放行：`private`、`wake_prefix`。即使 `passive_mode=full` 也直接放行；`ignore_user` 等硬策略仍然优先。
+- 自主来源：`mention`、`reply_to_bot`、`unknown`（无法确认来源时保守处理）或 `ambient`。群聊里 @Bot 或引用 Bot 不再直接放行，与 `unknown` 一样调用一次兴趣模型；没有新外部消息、未到最小评估间隔、配额不足或重复事件时直接 `observe`，不调用模型。
 - 自主建议 `reply` 时必须引用本会话证据锚点并说明新增贡献，否则拒绝；拒绝不会默认放行。
 - `observe` 也可通过 `interest_update` 提交摘要、等待条件和新证据，准入后建立有限检查点。重复证据、Bot 自身回复和只改摘要都不能续期。
 - 模型超时、网络错误、非法结构或插件调用预算耗尽时统一 `observe`（拦截主模型），不再 fail-open。
@@ -88,7 +88,7 @@ AstrBot 唤醒事件（私聊/@/引用/唤醒前缀）
 
 | 指令 | 作用 |
 | --- | --- |
-| `/attention status [UMO\|--all]` | 状态、兴趣数、机会数、预算、调度器和最近决策 |
+| `/attention status [UMO\|--all]` | 状态、兴趣数、机会数、活跃指令、预算、调度器和最近决策（决策记录在消息末尾） |
 | `/attention list [UMO\|--all]` | 检查点列表 |
 | `/attention interests [UMO\|--all]` | 兴趣列表 |
 | `/attention add [分钟] [原因]` | 为当前群创建扫描检查点 |
@@ -107,7 +107,7 @@ AstrBot 唤醒事件（私聊/@/引用/唤醒前缀）
 ## 预算与限制
 
 - **模型/语义检查预算**（全局）：`daily_model_call_budget`、`daily_active_check_budget`；只统计插件自身 gateway 调用，不覆盖 AstrBot 原始主模型的全部调用。
-- **自主参与预算**：每会话 `session_autonomous_reply_budget` + 全局 `daily_autonomous_reply_budget`；获批尝试时原子扣减，失败不返还。显式请求不计入。
+- **自主参与预算**：每会话 `session_autonomous_reply_budget` + 全局 `daily_autonomous_reply_budget`；获批尝试时原子扣减，失败不返还。私聊与唤醒前缀请求不计入。
 - **冷却**：`global_send_cooldown_minutes` 与 `session_autonomous_cooldown_minutes`，从获批尝试计时，失败不消除本次冷却。
 - **无进展**：连续 3 次无进展、检查余额耗尽、TTL 到期、明确结束或被更高优先级兴趣替换时关闭兴趣并取消关联检查点。
 - **容量**：槽位满时只有更高等级的新候选可替换最弱可替换兴趣；同等级保留原兴趣；管理员兴趣受保护。
@@ -147,6 +147,7 @@ AstrBot 唤醒事件（私聊/@/引用/唤醒前缀）
 
 - 状态文件：`AstrBot/data/plugin_data/astrbot_plugin_autonomous_attention/attention_state.json`。
 - 默认 INFO 日志记录会话、决策、稳定原因码和简短理由，不记录完整聊天内容、人格或完整提示词。
+- 被动路径每个判定点输出 `Passive attention gate: ...`（含 `wake_source` 与拒绝码），调用兴趣模型前为 `verdict=invoke`，结束后输出 `Passive attention: ...`；直接放行与主动检查分别输出 `Passive explicit pass`、`Active attention agent invoked`，适配层每次决策模型调用输出 `Attention decision model call`。
 - 判断记录包含 `umo/interest_id/checkpoint_id/anchor_message_id/wake_source`、消息进度、模型建议、代码决定、拒绝码、预留 ID 和发送结果。
 - 汇总使用持久化累计计数，区分外部消息、语义判断、建议参与、获批尝试、被动放行和主动成功发送，不受最近日志条数限制。明确生成失败、明确发送失败与发送结果不明分别记录；平台超时或未知异常不自动重试。
 - 工具调用返回结果不会进入兴趣模型 prompt；`build_passive_request` 会过滤 `role=tool`、工具协议消息和工具结果内容块。

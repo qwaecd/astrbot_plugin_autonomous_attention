@@ -23,8 +23,8 @@ from typing import Any
 
 from .models import (
     CHECKPOINT_KINDS,
+    DIRECT_PASS_WAKE_SOURCES,
     DIRECTIVE_TYPES,
-    EXPLICIT_WAKE_SOURCES,
     INTEREST_ACTIVE_STATUSES,
     OPPORTUNITY_KINDS,
     SOURCE_ADMIN,
@@ -554,7 +554,12 @@ class AttentionControlService:
             )
         expires_at = self._resolve_expiry(
             actor,
-            max_hours=self.settings.main_agent_max_intent_hours,
+            # Interests keep their own TTL even when the intent limit is short:
+            # the intent budget bounds directives, not interest lifetime.
+            max_minutes=max(
+                self.settings.main_agent_max_intent_minutes,
+                self.settings.interest_ttl_minutes,
+            ),
             requested_minutes=expires_in_minutes,
             allow_permanent=False,
             default_minutes=self.settings.interest_ttl_minutes,
@@ -1474,14 +1479,15 @@ class AttentionControlService:
     ) -> ParticipationApproval:
         """Unified admission for passive and active autonomous participation.
 
-        Explicit wake sources pass directly without consuming an autonomous
-        quota. Autonomous paths must present a valid, unconsumed anchor and
-        pass the session/global quota checks in the same critical section.
+        Direct-pass wake sources (private chat, wake prefix) pass without
+        consuming an autonomous quota. Mentions, replies to the bot and
+        autonomous paths must present a valid, unconsumed anchor and pass the
+        session/global quota checks in the same critical section.
         """
 
-        explicit = wake_source in EXPLICIT_WAKE_SOURCES
+        direct_pass = wake_source in DIRECT_PASS_WAKE_SOURCES
         action = str(suggested_action or "").strip().lower()
-        if explicit:
+        if direct_pass:
             if action not in {"reply", "pass"}:
                 return ParticipationApproval(
                     approved=False,
@@ -1800,7 +1806,7 @@ class AttentionControlService:
                 )
         expires_at = self._resolve_expiry(
             actor,
-            max_hours=self.settings.main_agent_max_intent_hours,
+            max_minutes=self.settings.main_agent_max_intent_minutes,
             requested_minutes=expires_in_minutes,
             allow_permanent=False,
             default_minutes=self.settings.interest_ttl_minutes,
@@ -1890,7 +1896,7 @@ class AttentionControlService:
         kind = "interest" if isinstance(interest, dict) else "session_scan"
         expires_at = self._resolve_expiry(
             actor,
-            max_hours=self.settings.main_agent_max_intent_hours,
+            max_minutes=self.settings.main_agent_max_intent_minutes,
             requested_minutes=expires_in_minutes_from_minutes(minutes),
             allow_permanent=False,
             default_minutes=self.settings.interest_ttl_minutes,
@@ -2047,7 +2053,7 @@ class AttentionControlService:
                     target=umo,
                     reason="explicit stop_focus",
                     expires_at=add_minutes(
-                        moment, self.settings.main_agent_max_intent_hours * 60
+                        moment, self.settings.main_agent_max_intent_minutes
                     ),
                 )
         if not actor.is_admin:
@@ -2131,7 +2137,7 @@ class AttentionControlService:
             )
         expires_at = self._resolve_expiry(
             actor,
-            max_hours=self.settings.main_agent_max_policy_hours,
+            max_minutes=self.settings.main_agent_max_policy_hours * 60,
             requested_minutes=expires_in_minutes,
             allow_permanent=actor.is_admin,
             default_minutes=self.settings.main_agent_max_policy_hours * 60,
@@ -2936,7 +2942,7 @@ class AttentionControlService:
         self,
         actor: Actor,
         *,
-        max_hours: int,
+        max_minutes: int,
         requested_minutes: int | None,
         allow_permanent: bool,
         default_minutes: int,
@@ -2947,10 +2953,11 @@ class AttentionControlService:
         else:
             minutes = int(requested_minutes)
         if not actor.is_admin:
-            minutes = min(minutes, max_hours * 60)
+            minutes = min(minutes, max(1, int(max_minutes)))
         else:
             minutes = min(
-                minutes, max(self.settings.max_auto_policy_hours, max_hours) * 60
+                minutes,
+                max(self.settings.max_auto_policy_hours * 60, int(max_minutes)),
             )
         if allow_permanent and actor.is_admin and minutes <= 0:
             return None

@@ -9,11 +9,44 @@
 - 未发布的改动先写入 `## 未发布` 小节，发布时改名为版本号并补上日期。
 - 发布时同步三处版本号：本文件、`metadata.yaml` 的 `version`、Git 标签。
 
+## v1.2.0 - 2026-10-29
+
+被动路径的行为与可观测性更新：群聊 @Bot、引用 Bot 改为交给兴趣模型判断，所有判定点与注意力模型调用都能从 INFO 日志追踪，`/attention status` 可直接看到活跃指令。
+
+### 新增
+
+- `/attention status` 增加“活跃指令”段落，列出 `stop_focus`、`focus_topic`、`schedule_check`、`ignore_user` 等指令的 ID、目标、来源、到期时间和原因；最近决策固定在消息末尾。
+- 被动路径每个判定点输出 INFO 日志 `Passive attention gate: ...`，包含 `umo`、`user`、`wake_source`、`verdict` 和拒绝码；调用兴趣模型前输出 `verdict=invoke`，结束后输出 `Passive attention: ...`。
+- 直接放行输出 `Passive explicit pass: ...`；主动路径调用注意力 agent 前输出 `Active attention agent invoked: ...`；适配层每次决策模型调用输出 `Attention decision model call: ...`。
+- 新增回归测试：`mention` / `reply_to_bot` 走兴趣模型、`wake_prefix` 直接放行、状态快照展示活跃指令、意图时限新旧键兼容以及兴趣 TTL 不被较短的意图上限截断。
+
+### 变更
+
+- 群聊中的 `mention`（@Bot）与 `reply_to_bot`（引用 Bot）不再直接放行主模型，改为与 `unknown` 一样交给兴趣模型判断：需要证据锚点、占用会话与全局自主配额，未获批时拦截主模型；门控自身异常时也不再 fail-open。
+- `private` 与 `wake_prefix` 仍保持直接放行，不调用兴趣模型、不占自主配额。
+- 指标口径随之调整：`显式放行` 只统计 `private` / `wake_prefix`，@Bot 与引用 Bot 计入 `语义判断` 和自主配额。
+- 主 Agent 意图时限改为分钟：`budgets.main_agent_max_intent_hours` 更名为 `main_agent_max_intent_minutes`，默认 30 分钟（原默认 24 小时）。停止关注、关注、话题关注和定时检查均使用该时限，停止关注后的静默上限也从 24 小时缩短为 30 分钟。
+- 兴趣有效期仍由 `attention_limits.interest_ttl_minutes`（默认 120 分钟）决定，不会被较短的意图时限截断。
+
+### 修复
+
+- 唤醒来源判定与钩子日志改用 `getattr` 读取事件字段，适配器事件缺少 `unified_msg_origin` / `get_group_id` 时不再抛 `AttributeError`。
+- 配置哨兵值 `-1` 不再被误裁剪为 1 分钟：缺少新键时回落默认 30 分钟，或按旧小时键换算。
+
+### 兼容性
+
+- 旧键 `budgets.main_agent_max_intent_hours` 仍可读取：缺少新键时按小时 × 60 换算为分钟并输出一次兼容提示；显式设置 `main_agent_max_intent_minutes` 时以新键为准。
+- 行为变化会影响群里 @Bot、引用 Bot 的响应率：这些消息现在受 `passive_mode`、群白名单、评估节流（`min_evaluation_interval_seconds`）、静默时段和自主配额约束，配额耗尽时直接跳过。升级前建议先用 `/attention dryrun on` 观察，或调大 `attention_limits` 中的配额。
+
 ## v1.1.1 - 2026-10-29
 
 ### 变更
 
-- `metadata.yaml` 新增 `repo` 字段，指向本仓库，插件市场可直接跳转。
+- `metadata.yaml` 新增 `repo` 字段，指向本仓库，插件市场可直接跳转；版本号更新为 `v1.1.1`。
+
+### 修复
+
+- 日志记录器统一使用 `from astrbot.api import logger`，移除 Python 内置 `logging` 的用法，符合 AstrBot 插件上架规范。
 
 ## v1.1.0 - 2026-10-29
 

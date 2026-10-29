@@ -27,7 +27,7 @@ from .astrbot_adapter import (
 )
 from .attention import AttentionEngine, Settings, StateStore
 from .attention.control import Actor
-from .attention.models import EXPLICIT_WAKE_SOURCES, SOURCE_MAIN_AGENT
+from .attention.models import DIRECT_PASS_WAKE_SOURCES, SOURCE_MAIN_AGENT
 from .attention.timeutil import to_iso
 from .attention.validation import clip_text
 
@@ -283,21 +283,49 @@ class AutonomousAttentionPlugin(Star):
         history and system prompt that the main model would receive.
         """
 
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
         if not self._ready or self.engine is None:
+            logger.info(
+                "Passive attention gate: umo=%s verdict=skip code=not_ready", umo
+            )
             return
+        wake_source = classify_wake_source(event, self._wake_prefixes)
         if (
             event.get_platform_name() == "cron"
             or event.get_extra("cron_payload") is not None
         ):
+            logger.info(
+                "Passive attention gate: umo=%s wake_source=%s verdict=skip "
+                "code=cron_event",
+                umo,
+                wake_source,
+            )
             return
         if event.get_extra("_aa_skip_passive"):
+            logger.info(
+                "Passive attention gate: umo=%s wake_source=%s verdict=skip "
+                "code=plugin_request",
+                umo,
+                wake_source,
+            )
             return
         if not event.is_at_or_wake_command:
+            logger.info(
+                "Passive attention gate: umo=%s wake_source=%s verdict=skip "
+                "code=not_woken",
+                umo,
+                wake_source,
+            )
             return
         if event.get_extra("_aa_passive_handled"):
+            logger.info(
+                "Passive attention gate: umo=%s wake_source=%s verdict=skip "
+                "code=already_handled",
+                umo,
+                wake_source,
+            )
             return
         event.set_extra("_aa_passive_handled", True)
-        wake_source = classify_wake_source(event, self._wake_prefixes)
         try:
             request_obj = build_passive_request(
                 event,
@@ -312,8 +340,9 @@ class AutonomousAttentionPlugin(Star):
             raise
         except Exception:
             logger.exception("Passive attention gate failed.")
-            if wake_source not in EXPLICIT_WAKE_SOURCES:
-                # Autonomous requests must not fail open.
+            if wake_source not in DIRECT_PASS_WAKE_SOURCES:
+                # Judged requests (mentions, replies, autonomous) must not
+                # fail open when the gate itself raises.
                 try:
                     event.stop_event()
                     event.set_extra("_aa_blocked", True)
@@ -671,10 +700,24 @@ class AutonomousAttentionPlugin(Star):
             f"兴趣：{snapshot.get('interest_count', 0)} 个；"
             f"待用参与机会：{snapshot.get('opportunity_count', 0)} 个",
             f"忽略策略：{snapshot.get('policy_count', 0)} 条",
-            f"预算：{snapshot.get('budget')}",
-            f"调度器：{'运行中' if scheduler.get('running') else '已停止'}，"
-            f"活动任务 {scheduler.get('active_tasks', 0)} 个",
         ]
+        directives = snapshot.get("directives") or []
+        lines.append(f"活跃指令：{len(directives)} 条")
+        for item in directives[:5]:
+            lines.append(
+                f"- {item.get('directive_id') or '-'} | {item.get('type') or '-'} | "
+                f"目标 {item.get('target') or '-'} | "
+                f"来源 {item.get('source') or '-'} | "
+                f"到期 {self._short_time(item.get('expires_at')) or '永久'} | "
+                f"{clip_text(item.get('reason'), 40)}"
+            )
+        lines.extend(
+            [
+                f"预算：{snapshot.get('budget')}",
+                f"调度器：{'运行中' if scheduler.get('running') else '已停止'}，"
+                f"活动任务 {scheduler.get('active_tasks', 0)} 个",
+            ]
+        )
         if snapshot.get("migrated"):
             lines.append("状态已从 v1 迁移到 v2。")
         metrics = snapshot.get("metrics") or {}

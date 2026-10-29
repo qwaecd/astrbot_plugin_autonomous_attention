@@ -41,7 +41,10 @@ OPPORTUNITY_STATUSES = frozenset(
 WAKE_SOURCES = frozenset(
     {"private", "mention", "reply_to_bot", "wake_prefix", "ambient", "unknown"}
 )
-EXPLICIT_WAKE_SOURCES = frozenset({"private", "mention", "reply_to_bot", "wake_prefix"})
+# Wake sources that reach the main model without a passive decision.
+# ``mention`` and ``reply_to_bot`` are intentionally absent: in group chat they
+# are judged by the interest model like any other autonomous wake-up.
+DIRECT_PASS_WAKE_SOURCES = frozenset({"private", "wake_prefix"})
 
 CHECKPOINT_KINDS = frozenset({"interest", "session_scan"})
 CHECKPOINT_STATUSES = frozenset(

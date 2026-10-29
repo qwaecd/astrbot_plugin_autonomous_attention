@@ -299,7 +299,7 @@ def format_resources(resources: dict[str, Any]) -> str:
     return (
         "本会话自主尝试 {session_used}/{session_limit}；"
         "全局自主尝试 {global_used}/{global_limit}；"
-        "显式请求不受此额度限制".format(
+        "私聊与唤醒前缀请求不受此额度限制".format(
             session_used=resources.get("session_attempts", 0),
             session_limit=resources.get("session_limit", 0),
             global_used=resources.get("global_attempts", 0),

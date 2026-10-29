@@ -835,6 +835,48 @@ async def test_explicit_private_request_passes_without_model(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_wake_prefix_request_passes_without_model(tmp_path: Path) -> None:
+    engine, store, gateway = await make_engine(tmp_path)
+    try:
+        outcome = await engine.handle_passive(
+            passive_request(message_id="m1", wake_source="wake_prefix", text="/aa 你好")
+        )
+        decisions = list(store.state["decisions"])
+    finally:
+        await engine.stop()
+    assert outcome.block is False
+    assert outcome.code == "explicit_pass"
+    assert gateway.calls == []
+    assert decisions[-1]["code_decision"] == "explicit_pass"
+    assert decisions[-1]["wake_source"] == "wake_prefix"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wake_source", ["mention", "reply_to_bot"])
+async def test_mention_and_reply_to_bot_are_judged_by_interest_model(
+    tmp_path: Path, wake_source: str
+) -> None:
+    engine, store, gateway = await make_engine(
+        tmp_path,
+        gateway=FakeGateway([ModelResult(text=reply_suggestion(anchor="m1"))]),
+    )
+    try:
+        await add_message(engine, message_id="m1")
+        await admit_interest(engine, evidence=["m1"])
+        outcome = await engine.handle_passive(
+            passive_request(wake_source=wake_source, text="插件怎么配置")
+        )
+        decisions = list(store.state["decisions"])
+    finally:
+        await engine.stop()
+    assert outcome.block is False
+    assert outcome.code == "autonomous_approved"
+    assert gateway.calls and gateway.calls[0]["purpose"] == "decision"
+    assert decisions[-1]["wake_source"] == wake_source
+    assert decisions[-1]["code_decision"] == "pass"
+
+
+@pytest.mark.asyncio
 async def test_autonomous_reply_requires_valid_evidence(tmp_path: Path) -> None:
     engine, store, gateway = await make_engine(
         tmp_path,
@@ -1260,3 +1302,57 @@ def test_active_reply_prompt_has_no_dynamic_state() -> None:
     prompt = build_active_reply_system_prompt(ctx, make_settings())
     assert "测试人格" in prompt
     assert "SECRET_" not in prompt
+
+
+def test_intent_limit_defaults_to_30_minutes_and_reads_legacy_hours() -> None:
+    assert Settings.from_mapping({}).main_agent_max_intent_minutes == 30
+    sentinel = Settings.from_mapping(
+        {"budgets": {"main_agent_max_intent_minutes": -1, "main_agent_max_intent_hours": -1}}
+    )
+    assert sentinel.main_agent_max_intent_minutes == 30
+    legacy = Settings.from_mapping({"budgets": {"main_agent_max_intent_hours": 2}})
+    assert legacy.main_agent_max_intent_minutes == 120
+    explicit = Settings.from_mapping(
+        {
+            "budgets": {
+                "main_agent_max_intent_hours": 2,
+                "main_agent_max_intent_minutes": 45,
+            }
+        }
+    )
+    assert explicit.main_agent_max_intent_minutes == 45
+
+
+@pytest.mark.asyncio
+async def test_status_reports_active_directives(tmp_path: Path) -> None:
+    engine, _, _ = await make_engine(tmp_path)
+    await engine.scheduler.stop()
+    try:
+        result = await engine.control.stop_focus(
+            Actor(source=SOURCE_MAIN_AGENT, session="p:GroupMessage:g"),
+        )
+        snapshot = await engine.status_snapshot("p:GroupMessage:g")
+    finally:
+        await engine.stop()
+    assert result.ok
+    assert snapshot["directive_count"] == 1
+    directive = snapshot["directives"][0]
+    assert directive["type"] == "stop_focus"
+    assert directive["status"] == "active"
+    assert directive["created_by_session"] == "p:GroupMessage:g"
+
+
+@pytest.mark.asyncio
+async def test_short_intent_limit_does_not_cut_interest_ttl(tmp_path: Path) -> None:
+    engine, _, _ = await make_engine(tmp_path)
+    await engine.scheduler.stop()
+    try:
+        await add_message(engine, message_id="m1")
+        interest = await admit_interest(
+            engine, evidence=["m1"], source=SOURCE_MAIN_AGENT
+        )
+    finally:
+        await engine.stop()
+    expires = datetime.fromisoformat(interest["expires_at"])
+    remaining = expires - datetime.now(expires.tzinfo)
+    assert remaining > timedelta(minutes=90)

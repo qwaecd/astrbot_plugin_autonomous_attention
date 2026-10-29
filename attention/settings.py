@@ -140,7 +140,7 @@ class Settings:
     owner_override: bool = True
     max_auto_policy_hours: int = 168
     main_agent_max_policy_hours: int = 24
-    main_agent_max_intent_hours: int = 24
+    main_agent_max_intent_minutes: int = 30
     main_agent_tools_enabled: bool = True
     timezone: str = ""
     tz: tzinfo = field(default_factory=lambda: resolve_timezone(""))
@@ -217,12 +217,23 @@ class Settings:
             min_interval,
             43200,
         )
+        intent_minutes = _get(data, "budgets", "main_agent_max_intent_minutes")
+        if intent_minutes is None or str(intent_minutes) == "-1":
+            intent_minutes = None
+            legacy_hours = _get(data, "budgets", "main_agent_max_intent_hours")
+            if legacy_hours is not None and str(legacy_hours) != "-1":
+                intent_minutes = _int(legacy_hours, 24, 0, 8760) * 60
         for new_key, old_section, old_key in (
             ("daily_autonomous_reply_budget", "budgets", "daily_active_message_budget"),
             (
                 "session_autonomous_cooldown_minutes",
                 "scheduling",
                 "group_send_cooldown_minutes",
+            ),
+            (
+                "main_agent_max_intent_minutes",
+                "budgets",
+                "main_agent_max_intent_hours",
             ),
         ):
             old_value = _get(data, old_section, old_key)
@@ -396,11 +407,11 @@ class Settings:
                 1,
                 8760,
             ),
-            main_agent_max_intent_hours=_int(
-                _get(data, "budgets", "main_agent_max_intent_hours"),
-                24,
+            main_agent_max_intent_minutes=_int(
+                intent_minutes,
+                30,
                 1,
-                8760,
+                525600,
             ),
             main_agent_tools_enabled=_bool(
                 _get(data, "general", "main_agent_tools_enabled"),

@@ -21,7 +21,7 @@ from astrbot.api import logger
 from .active import ActiveAttentionRunner
 from .control import Actor, AttentionControlService
 from .models import (
-    EXPLICIT_WAKE_SOURCES,
+    DIRECT_PASS_WAKE_SOURCES,
     SOURCE_ADMIN,
     SOURCE_ATTENTION_AGENT,
     SOURCE_MAIN_AGENT,
@@ -579,26 +579,61 @@ class AttentionEngine:
     # Passive attention
     # ------------------------------------------------------------------
 
+    def _log_passive_gate(
+        self,
+        request: PassiveRequest,
+        verdict: str,
+        code: str,
+        reason: str,
+    ) -> None:
+        """Log whether this wake-up reaches the interest model.
+
+        Every decision point on the passive path goes through this helper so an
+        operator can tell which gate stopped a message from being judged.
+        """
+
+        logger.info(
+            "Passive attention gate: umo=%s user=%s wake_source=%s "
+            "verdict=%s code=%s reason=%s",
+            request.umo,
+            request.user_id or "-",
+            request.wake_source or "-",
+            verdict,
+            code or "-",
+            clip_text(reason, 120),
+        )
+
     @_simulated_operation
     async def handle_passive(self, request: PassiveRequest) -> PassiveOutcome:
         """Run the passive path for one woken message.
 
-        Explicit requests pass directly after hard policy checks. Autonomous
-        suggestions need code approval through the control layer; failures
-        never default to passing the main model.
+        Direct-pass requests (private chat, wake prefix) pass after hard policy
+        checks. Mentions, replies to the bot and unknown wake-ups are judged by
+        the interest model, and their suggestions need code approval through the
+        control layer; failures never default to passing the main model.
         """
 
         if not self._started or not self.settings.enabled:
+            self._log_passive_gate(
+                request, "skip", "plugin_disabled", "plugin is not running"
+            )
             return PassiveOutcome(
                 decision="pass", block=False, reason="plugin disabled"
             )
         if not self.settings.passive_full:
+            self._log_passive_gate(
+                request,
+                "skip",
+                "passive_mode",
+                f"passive mode is {self.settings.passive_mode}",
+            )
             return PassiveOutcome(
                 decision="pass",
                 block=False,
                 reason=f"passive mode is {self.settings.passive_mode}",
             )
         if request.is_command:
+            self._log_passive_gate(request, "skip", "command", "command event")
             return PassiveOutcome(decision="pass", block=False, reason="command event")
         moment = self.policy.now()
         if not request.timestamp:
@@ -608,6 +643,9 @@ class AttentionEngine:
             request.umo,
             request.platform_id,
         ):
+            self._log_passive_gate(
+                request, "skip", "group_not_allowed", "group not allowed"
+            )
             return PassiveOutcome(
                 decision="pass", block=False, reason="group not allowed"
             )
@@ -617,6 +655,9 @@ class AttentionEngine:
                 if self.control._owner_mismatch(
                     request.umo, request.platform_id, request.group_id
                 ):
+                    self._log_passive_gate(
+                        request, "skip", "scope_mismatch", "session route mismatch"
+                    )
                     return PassiveOutcome(
                         code="scope_mismatch", reason="session route mismatch"
                     )
@@ -639,6 +680,9 @@ class AttentionEngine:
             self.control.expire_interests_locked(self.store.state, moment)
             done = self._passive_done.get(key)
             if done is not None:
+                self._log_passive_gate(
+                    request, "skip", "duplicate_event", "event already handled"
+                )
                 self._record_decision_locked(
                     kind="passive",
                     umo=request.umo,
@@ -657,6 +701,9 @@ class AttentionEngine:
                     reason="event already handled",
                 )
             if key in self._passive_inflight:
+                self._log_passive_gate(
+                    request, "skip", "duplicate_event", "decision already running"
+                )
                 return PassiveOutcome(
                     decision="observe",
                     block=True,
@@ -665,6 +712,9 @@ class AttentionEngine:
             if self.control._owner_mismatch(
                 request.umo, request.platform_id, request.group_id
             ):
+                self._log_passive_gate(
+                    request, "skip", "scope_mismatch", "session route mismatch"
+                )
                 return PassiveOutcome(
                     code="scope_mismatch", reason="session route mismatch"
                 )
@@ -698,6 +748,12 @@ class AttentionEngine:
                 is_admin=request.is_admin,
             )
             if blocked is not None:
+                self._log_passive_gate(
+                    request,
+                    "skip",
+                    "hard_policy",
+                    str(blocked.get("reason") or "hard policy"),
+                )
                 self._remember_passive(
                     key,
                     PassiveOutcome(
@@ -732,7 +788,7 @@ class AttentionEngine:
                     code="hard_policy",
                 )
 
-            if request.wake_source in EXPLICIT_WAKE_SOURCES:
+            if request.wake_source in DIRECT_PASS_WAKE_SOURCES:
                 approval = self.control.approve_participation_locked(
                     self.store.state,
                     umo=request.umo,
@@ -743,6 +799,9 @@ class AttentionEngine:
                     anchor_message_id=request.message_id,
                 )
                 if not approval.approved:
+                    self._log_passive_gate(
+                        request, "skip", approval.code, approval.message
+                    )
                     return PassiveOutcome(code=approval.code, reason=approval.message)
                 self._record_decision_locked(
                     kind="passive",
@@ -771,10 +830,25 @@ class AttentionEngine:
                     ),
                 )
                 self._flush_locked()
+                logger.info(
+                    "Passive explicit pass: umo=%s user=%s wake_source=%s "
+                    "opportunity=%s reservation=%s",
+                    request.umo,
+                    request.user_id or "-",
+                    request.wake_source,
+                    str((approval.opportunity or {}).get("opportunity_id") or "-"),
+                    approval.reservation_id or "-",
+                )
                 return self._passive_done[key]
 
             stop = self.control.stop_directive(self.store.state, umo=request.umo)
             if stop is not None:
+                self._log_passive_gate(
+                    request,
+                    "skip",
+                    "stop_directive",
+                    "main agent stop_focus directive",
+                )
                 self._record_decision_locked(
                     kind="passive",
                     umo=request.umo,
@@ -800,6 +874,9 @@ class AttentionEngine:
             if int(session.get("external_message_seq") or 0) <= int(
                 session.get("last_decision_seq") or 0
             ):
+                self._log_passive_gate(
+                    request, "skip", "no_new_messages", "no new external message"
+                )
                 self._record_decision_locked(
                     kind="passive",
                     umo=request.umo,
@@ -832,6 +909,12 @@ class AttentionEngine:
                 < self.settings.min_evaluation_interval_seconds
             )
             if throttled:
+                self._log_passive_gate(
+                    request,
+                    "skip",
+                    "evaluation_throttled",
+                    "minimum evaluation interval has not elapsed",
+                )
                 self._record_decision_locked(
                     kind="passive",
                     umo=request.umo,
@@ -855,6 +938,12 @@ class AttentionEngine:
                 return self._passive_done[key]
 
             if self.policy.is_quiet(moment):
+                self._log_passive_gate(
+                    request,
+                    "skip",
+                    "quiet_hours",
+                    "autonomous participation is quiet",
+                )
                 return PassiveOutcome(
                     code="quiet_hours", reason="autonomous participation is quiet"
                 )
@@ -864,6 +953,9 @@ class AttentionEngine:
                 and cp.get("status") == "running"
                 for cp in (self.store.state.get("checkpoints") or {}).values()
             ):
+                self._log_passive_gate(
+                    request, "skip", "session_busy", "session evaluation in progress"
+                )
                 return PassiveOutcome(
                     code="session_busy", reason="session evaluation in progress"
                 )
@@ -889,6 +981,12 @@ class AttentionEngine:
                 self.store.state, request.umo, moment
             )
             if not allowed:
+                self._log_passive_gate(
+                    request,
+                    "skip",
+                    quota_reason,
+                    "autonomous participation quota unavailable",
+                )
                 self._record_decision_locked(
                     kind="passive",
                     umo=request.umo,
@@ -913,6 +1011,12 @@ class AttentionEngine:
             if not self.policy.consume_model_call(
                 self.store.live_state, moment, "decision"
             ):
+                self._log_passive_gate(
+                    request,
+                    "skip",
+                    "budget_exhausted",
+                    "daily model-call budget exhausted",
+                )
                 self._record_decision_locked(
                     kind="passive",
                     umo=request.umo,
@@ -950,6 +1054,13 @@ class AttentionEngine:
                 self._evaluating_sessions.discard(request.umo)
                 raise
 
+        self._log_passive_gate(
+            request,
+            "invoke",
+            "decision_model",
+            "calling the attention agent "
+            f"(timeout {self.settings.decision_timeout_seconds}s)",
+        )
         try:
             async with self._passive_semaphore:
                 run = await self.passive_runner.decide(
@@ -1066,9 +1177,11 @@ class AttentionEngine:
             self._flush_locked()
 
         logger.info(
-            "Passive attention: umo=%s user=%s decision=%s code=%s reason=%s",
+            "Passive attention: umo=%s user=%s wake_source=%s "
+            "decision=%s code=%s reason=%s",
             request.umo,
             request.user_id or "-",
+            request.wake_source or "-",
             outcome.decision,
             outcome.code or "-",
             clip_text(outcome.reason, 120),
@@ -2235,6 +2348,15 @@ class AttentionEngine:
                     )
             return refreshed
 
+        logger.info(
+            "Active attention agent invoked: checkpoint=%s umo=%s kind=%s "
+            "interest=%s timeout=%ss",
+            checkpoint_id,
+            umo,
+            checkpoint.get("kind") or "-",
+            str(checkpoint.get("interest_id") or "-"),
+            self.settings.decision_timeout_seconds,
+        )
         result = await self.active_runner.run(ctx, consume_call, window_loader)
         evaluated_seq = max(evaluated_seq, int(ctx.evaluated_seq or 0))
 
@@ -3202,6 +3324,7 @@ class AttentionEngine:
             moment = self.policy.now()
             self.control.expire_interests_locked(state, moment)
             self.control.cleanup_locked(state, moment)
+            self.control.expire_directives_locked(state, moment)
             checkpoints = state.get("checkpoints", {})
             counts: dict[str, int] = {}
             for raw in checkpoints.values():
@@ -3242,6 +3365,17 @@ class AttentionEngine:
                     if isinstance(item, dict)
                     and item.get("status") in {"pending", "reserved"}
                 ]
+            directives = [
+                item
+                for item in (state.get("directives") or {}).values()
+                if isinstance(item, dict)
+                and item.get("status") == "active"
+                and (not umo or item.get("created_by_session") == umo)
+            ]
+            directives.sort(
+                key=lambda item: str(item.get("updated_at") or ""),
+                reverse=True,
+            )
             counters = [
                 value
                 for key, value in (state.get("metrics") or {}).items()
@@ -3278,6 +3412,8 @@ class AttentionEngine:
                 "interest_count": len(interests),
                 "opportunity_count": len(opportunities),
                 "policy_count": len(state.get("policies") or {}),
+                "directive_count": len(directives),
+                "directives": directives,
                 "budget": self.policy.describe_budget(state, umo),
                 "scheduler": self.scheduler.status(),
                 "metrics": metrics,
