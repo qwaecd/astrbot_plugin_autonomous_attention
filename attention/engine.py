@@ -22,6 +22,7 @@ from .active import ActiveAttentionRunner
 from .control import Actor, AttentionControlService
 from .models import (
     DIRECT_PASS_WAKE_SOURCES,
+    JUDGED_DIRECT_WAKE_SOURCES,
     SOURCE_ADMIN,
     SOURCE_ATTENTION_AGENT,
     SOURCE_MAIN_AGENT,
@@ -1393,7 +1394,10 @@ class AttentionEngine:
             )
             if len(existing) == 1:
                 interest_id = str(existing[0].get("interest_id") or "")
-        if not interest_id:
+        interestless = bool(
+            not interest_id and request.wake_source in JUDGED_DIRECT_WAKE_SOURCES
+        )
+        if not interest_id and not interestless:
             return ParticipationApproval(
                 approved=False,
                 code="interest_required",
@@ -1414,6 +1418,7 @@ class AttentionEngine:
             interest_id=interest_id,
             interest_update=decision.interest_update,
             consume_on_approval=True,
+            allow_interestless=interestless,
         )
 
     def _admit_interest_from_update_locked(

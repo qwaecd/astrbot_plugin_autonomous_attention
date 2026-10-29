@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 import time
@@ -22,18 +21,17 @@ from .astrbot_adapter import (
     AstrBotContextProvider,
     AstrBotMessageSender,
     AstrBotModelGateway,
-    build_passive_request,
     classify_wake_source,
 )
 from .attention import AttentionEngine, Settings, StateStore
 from .attention.control import Actor
-from .attention.models import DIRECT_PASS_WAKE_SOURCES, SOURCE_MAIN_AGENT
-from .attention.timeutil import to_iso
+from .attention.models import SOURCE_MAIN_AGENT
 from .attention.validation import clip_text
 
 PLUGIN_NAME = "astrbot_plugin_autonomous_attention"
 COMMAND_FILTER_CLASS_NAMES = {"CommandFilter", "CommandGroupFilter"}
 DURATION_RE = re.compile(r"^(\d+)\s*(m|min|分钟|h|小时|d|天)?$", re.IGNORECASE)
+ATTENTION_PROTOCOL_MARKER = "[Autonomous Attention Protocol]"
 
 
 class AdminOnlyFilter(filter.CustomFilter):
@@ -88,7 +86,6 @@ class AutonomousAttentionPlugin(Star):
             self.config,
             self._fallback_timezone,
         )
-        self._apply_log_level()
 
     def _refresh_wake_metadata(self) -> None:
         """Cache the AstrBot wake settings used to classify request sources."""
@@ -107,12 +104,6 @@ class AutonomousAttentionPlugin(Star):
             if isinstance(platform_settings, dict)
             else False
         )
-
-    def _apply_log_level(self) -> None:
-        try:
-            logger.setLevel(self.settings.log_level)
-        except Exception:
-            pass
 
     async def initialize(self) -> None:
         """Create the core and start the checkpoint scheduler."""
@@ -171,7 +162,6 @@ class AutonomousAttentionPlugin(Star):
             self.config,
             self._fallback_timezone,
         )
-        self._apply_log_level()
         if self.store is not None:
             self.store.max_decisions = self.settings.max_decision_log
         if self.gateway is not None:
@@ -194,6 +184,36 @@ class AutonomousAttentionPlugin(Star):
         save_config = getattr(self.config, "save_config", None)
         if callable(save_config):
             save_config()
+
+    def _inject_attention_protocol(self, request: ProviderRequest) -> bool:
+        """Append the configurable attention protocol to the main system prompt.
+
+        The main-agent request has already received AstrBot's persona and tool
+        setup when this plugin hook runs. Appending here places the protocol
+        after those instructions and before the provider assembles user input.
+
+        Args:
+            request: Main-agent provider request to update.
+
+        Returns:
+            ``True`` when a protocol was appended.
+        """
+
+        if (
+            not self.settings.main_agent_tools_enabled
+            or not self.settings.main_agent_attention_prompt_enabled
+        ):
+            return False
+        prompt = self.settings.main_agent_attention_prompt.strip()
+        if not prompt:
+            return False
+        current = str(getattr(request, "system_prompt", "") or "")
+        if ATTENTION_PROTOCOL_MARKER in current:
+            return False
+        request.system_prompt = (
+            f"{current.rstrip()}\n\n{ATTENTION_PROTOCOL_MARKER}\n{prompt}\n"
+        ).lstrip()
+        return True
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -277,10 +297,12 @@ class AutonomousAttentionPlugin(Star):
         event: AstrMessageEvent,
         request: ProviderRequest,
     ) -> None:
-        """Decide whether a woken message may reach the main model.
+        """Inject main-agent attention guidance and preserve hard blocking.
 
-        This hook runs last so the request already contains the same persona,
-        history and system prompt that the main model would receive.
+        The passive path no longer invokes the attention model for every woken
+        message. Existing user policies are enforced by ``observe_and_guard``;
+        this hook only rechecks them for races and adds the optional protocol to
+        the already-built main-agent system prompt.
         """
 
         umo = str(getattr(event, "unified_msg_origin", "") or "")
@@ -309,6 +331,12 @@ class AutonomousAttentionPlugin(Star):
                 wake_source,
             )
             return
+        injected = self._inject_attention_protocol(request)
+        if injected:
+            logger.debug(
+                "Main-agent attention protocol injected: umo=%s",
+                umo,
+            )
         if not event.is_at_or_wake_command:
             logger.info(
                 "Passive attention gate: umo=%s wake_source=%s verdict=skip "
@@ -327,43 +355,26 @@ class AutonomousAttentionPlugin(Star):
             return
         event.set_extra("_aa_passive_handled", True)
         try:
-            request_obj = build_passive_request(
-                event,
-                request,
-                is_command=self._is_command_event(event),
-                timestamp=to_iso(self.engine.policy.now()),
-                wake_prefixes=self._wake_prefixes,
-                friend_needs_wake_prefix=self._friend_needs_wake_prefix,
+            policy = await self.engine.check_hard_policy(
+                group_id=str(getattr(event, "get_group_id", lambda: "")() or ""),
+                user_id=str(getattr(event, "get_sender_id", lambda: "")() or ""),
+                umo=umo,
+                platform_id=str(getattr(event, "get_platform_id", lambda: "")() or ""),
+                is_admin=bool(getattr(event, "is_admin", lambda: False)()),
             )
-            outcome = await self.engine.handle_passive(request_obj)
-        except asyncio.CancelledError:
-            raise
         except Exception:
-            logger.exception("Passive attention gate failed.")
-            if wake_source not in DIRECT_PASS_WAKE_SOURCES:
-                # Judged requests (mentions, replies, autonomous) must not
-                # fail open when the gate itself raises.
-                try:
-                    event.stop_event()
-                    event.set_extra("_aa_blocked", True)
-                except Exception:
-                    pass
+            logger.exception("Passive hard-policy recheck failed.")
             return
-        if outcome.block:
+        if policy is not None:
             event.stop_event()
             event.set_extra("_aa_blocked", True)
             logger.info(
-                "Passive attention blocked main model: umo=%s user=%s "
-                "decision=%s code=%s reason=%s",
+                "Passive hard policy blocked main model: umo=%s user=%s "
+                "code=hard_policy reason=%s",
                 event.unified_msg_origin,
                 event.get_sender_id(),
-                outcome.decision,
-                outcome.code or "-",
-                clip_text(outcome.reason, 100),
+                clip_text(policy.get("reason"), 100),
             )
-        elif outcome.reservation_id:
-            event.set_extra("_aa_passive_reservation", outcome.reservation_id)
-            event.set_extra("_aa_passive_umo", request_obj.umo)
 
     @filter.on_llm_response()
     async def remember_bot_reply(

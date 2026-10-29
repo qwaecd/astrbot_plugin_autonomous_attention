@@ -20,11 +20,11 @@
           "full"
         ],
         "labels": [
-          "完全关闭",
+          "兼容关闭",
           "仅硬性策略",
-          "完整被动注意力"
+          "兼容完整模式"
         ],
-        "hint": "off：关闭被动判断（硬性忽略策略仍生效）；block_only：不调用兴趣模型，只执行用户忽略/群聊限制/权限等硬性策略；full：调用兴趣模型决定是否放行主模型。"
+        "hint": "保留旧配置兼容。当前被动路径不再逐条调用兴趣模型；off、block_only、full 均由代码硬策略和主模型注意力工具协作，主动路径仍由 Attention Agent 执行。"
       },
       "active_enabled": {
         "description": "启用主动检查",
@@ -38,23 +38,23 @@
         "default": true,
         "hint": "关闭后主模型无法调用 attention_query、attention_set_intent、attention_ignore_user 等工具；后台注意力 Agent 不受影响。"
       },
+      "main_agent_attention_prompt_enabled": {
+        "description": "注入主模型注意力协议",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后将注意力工具的使用协议追加到主模型人格 System Prompt 后；关闭后仍可由 AstrBot 自动提供工具描述。"
+      },
+      "main_agent_attention_prompt": {
+        "description": "主模型注意力协议",
+        "type": "text",
+        "default": "你可以使用注意力工具维护当前会话的兴趣和人格边界。\n\n普通明确请求应直接回答。\n当用户持续使用 @、引用或其他唤醒方式，但没有新的实质请求，\n并且已经形成打扰、纠缠或越界模式时，调用 attention_ignore_user。\n忽略策略成功后，当前消息仍可自然完成；后续该用户再次唤醒 Bot 时由硬性忽略策略拦截。\n只有明确的用户行为证据才能创建忽略策略。\n不要因为普通重复提问、正常追问或单次无礼表达就自动永久忽略用户。\n忽略策略必须使用有限时长和具体原因。",
+        "hint": "注入到主模型人格 System Prompt 后、用户消息前的短协议。"
+      },
       "dry_run": {
         "description": "dry-run 模式",
         "type": "bool",
         "default": false,
         "hint": "开启后仍会调用兴趣模型并记录决策，但不会拦截主模型，也不会真正发送主动消息。"
-      },
-      "log_level": {
-        "description": "日志详细程度",
-        "type": "string",
-        "default": "INFO",
-        "options": [
-          "INFO",
-          "DEBUG",
-          "WARNING",
-          "ERROR"
-        ],
-        "hint": "DEBUG 会输出更多模型与上下文诊断信息，但仍不会输出完整聊天内容。"
       },
       "timezone": {
         "description": "时区",
@@ -87,14 +87,14 @@
   "models": {
     "description": "模型与人格",
     "type": "object",
-    "hint": "兴趣决策模型、主动回复主模型、人格来源和两套评判标准。",
+    "hint": "主动兴趣决策模型、主动回复主模型、人格来源和评判标准。",
     "items": {
       "decision_provider_id": {
-        "description": "兴趣决策模型",
+        "description": "主动兴趣决策模型",
         "type": "string",
         "default": "",
         "_special": "select_provider",
-        "hint": "用于被动/主动兴趣判断的模型。留空时使用当前会话的主模型。"
+        "hint": "用于主动检查中的兴趣判断。留空时使用当前会话的主模型。"
       },
       "main_provider_id": {
         "description": "主动回复主模型",
@@ -124,10 +124,10 @@
         "hint": "当人格来源为 custom 时使用。留空则使用内置默认人格。"
       },
       "passive_criteria": {
-        "description": "被动评判标准",
+        "description": "旧版被动评判标准",
         "type": "text",
         "default": "",
-        "hint": "留空使用内置标准。用于判断一条唤醒消息是否值得交给主模型。"
+        "hint": "保留旧配置兼容；当前被动路径不再调用逐条兴趣模型。"
       },
       "active_criteria": {
         "description": "主动评判标准",
@@ -146,7 +146,7 @@
         "description": "允许关注和主动发言的群聊",
         "type": "list",
         "default": [],
-        "hint": "唯一群聊白名单：只有这里的群可以被观察、建立检查点、执行检查并接收主动消息。留空表示不启用任何群聊的注意力功能（私聊被动判断不受影响）。支持群号、platform_id:群号或完整 UMO。"
+        "hint": "唯一群聊白名单：只有这里的群可以被观察、建立检查点、执行检查并接收主动消息。留空表示不启用任何群聊的注意力功能（私聊主模型处理不受影响）。支持群号、platform_id:群号或完整 UMO。"
       },
       "blocked_group_ids": {
         "description": "禁止参与的群聊",

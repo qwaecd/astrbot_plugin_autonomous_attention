@@ -877,6 +877,68 @@ async def test_mention_and_reply_to_bot_are_judged_by_interest_model(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wake_source", ["mention", "reply_to_bot"])
+async def test_mention_reply_does_not_require_an_interest(
+    tmp_path: Path, wake_source: str
+) -> None:
+    engine, store, gateway = await make_engine(
+        tmp_path,
+        gateway=FakeGateway([ModelResult(text=reply_suggestion(anchor="m1"))]),
+    )
+    try:
+        await add_message(engine, message_id="m1")
+        outcome = await engine.handle_passive(
+            passive_request(wake_source=wake_source, text="插件怎么配置")
+        )
+        session = dict(store.state["sessions"]["p:GroupMessage:g"])
+        opportunities = list(store.state["opportunities"].values())
+    finally:
+        await engine.stop()
+    assert outcome.block is False
+    assert outcome.code == "autonomous_approved"
+    assert outcome.reservation_id
+    assert gateway.calls and gateway.calls[0]["purpose"] == "decision"
+    assert session["autonomous_attempts"] == 1
+    assert opportunities and opportunities[0]["interest_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_unknown_wake_source_still_requires_an_interest(tmp_path: Path) -> None:
+    engine, store, gateway = await make_engine(
+        tmp_path,
+        gateway=FakeGateway([ModelResult(text=reply_suggestion(anchor="m1"))]),
+    )
+    try:
+        await add_message(engine, message_id="m1")
+        outcome = await engine.handle_passive(
+            passive_request(wake_source="unknown", text="插件怎么配置")
+        )
+        session = dict(store.state["sessions"]["p:GroupMessage:g"])
+    finally:
+        await engine.stop()
+    assert outcome.block is True
+    assert outcome.code == "interest_required"
+    assert session.get("autonomous_attempts", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_mention_reply_still_requires_a_valid_anchor(tmp_path: Path) -> None:
+    engine, _, _ = await make_engine(
+        tmp_path,
+        gateway=FakeGateway([ModelResult(text=reply_suggestion(anchor="missing"))]),
+    )
+    try:
+        await add_message(engine, message_id="m1")
+        outcome = await engine.handle_passive(
+            passive_request(wake_source="mention", text="插件怎么配置")
+        )
+    finally:
+        await engine.stop()
+    assert outcome.block is True
+    assert outcome.code in {"invalid_anchor", "invalid_evidence"}
+
+
+@pytest.mark.asyncio
 async def test_autonomous_reply_requires_valid_evidence(tmp_path: Path) -> None:
     engine, store, gateway = await make_engine(
         tmp_path,
@@ -1307,7 +1369,12 @@ def test_active_reply_prompt_has_no_dynamic_state() -> None:
 def test_intent_limit_defaults_to_30_minutes_and_reads_legacy_hours() -> None:
     assert Settings.from_mapping({}).main_agent_max_intent_minutes == 30
     sentinel = Settings.from_mapping(
-        {"budgets": {"main_agent_max_intent_minutes": -1, "main_agent_max_intent_hours": -1}}
+        {
+            "budgets": {
+                "main_agent_max_intent_minutes": -1,
+                "main_agent_max_intent_hours": -1,
+            }
+        }
     )
     assert sentinel.main_agent_max_intent_minutes == 30
     legacy = Settings.from_mapping({"budgets": {"main_agent_max_intent_hours": 2}})

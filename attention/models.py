@@ -45,6 +45,11 @@ WAKE_SOURCES = frozenset(
 # ``mention`` and ``reply_to_bot`` are intentionally absent: in group chat they
 # are judged by the interest model like any other autonomous wake-up.
 DIRECT_PASS_WAKE_SOURCES = frozenset({"private", "wake_prefix"})
+# Judged wake sources that answer a direct user request. They still go through
+# the interest model, but an approved reply does not have to bind a lasting
+# interest: a one-off question is not a focus, and requiring one would make an
+# empty session ignore every mention.
+JUDGED_DIRECT_WAKE_SOURCES = frozenset({"mention", "reply_to_bot"})
 
 CHECKPOINT_KINDS = frozenset({"interest", "session_scan"})
 CHECKPOINT_STATUSES = frozenset(

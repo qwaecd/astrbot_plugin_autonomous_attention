@@ -16,7 +16,6 @@ PLUGIN_PARENT = Path(__file__).resolve().parent.parent.parent
 if str(PLUGIN_PARENT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_PARENT))
 
-import astrbot_plugin_autonomous_attention.main as main_module  # noqa: E402
 from astrbot_plugin_autonomous_attention.astrbot_adapter import (  # noqa: E402
     AstrBotContextProvider,
     AstrBotMessageSender,
@@ -281,9 +280,10 @@ async def test_waiting_hook_marks_plugin_request_for_passive_gate():
 
 
 @pytest.mark.asyncio
-async def test_passive_gate_accepts_user_request_after_provider_request_is_set():
+async def test_passive_gate_does_not_call_attention_model_for_user_requests():
     plugin = object.__new__(AutonomousAttentionPlugin)
     plugin._ready = True
+    plugin.settings = Settings.from_mapping({})
     calls: list[object] = []
 
     async def handle_passive(request):
@@ -308,14 +308,9 @@ async def test_passive_gate_accepts_user_request_after_provider_request_is_set()
         get_messages=lambda: [],
     )
 
-    original_builder = main_module.build_passive_request
-    main_module.build_passive_request = lambda *args, **kwargs: object()
-    try:
-        await plugin.passive_gate(event, object())
-    finally:
-        main_module.build_passive_request = original_builder
+    await plugin.passive_gate(event, SimpleNamespace(system_prompt=""))
 
-    assert len(calls) == 1
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -418,16 +413,15 @@ async def test_plugin_private_passive_gate_is_direct(tmp_path, monkeypatch) -> N
     try:
         await plugin.passive_gate(event, request)
         assert extras.get("_stopped") is None
-        decisions = plugin.engine.store.state["decisions"]
-        assert decisions[-1]["code_decision"] == "explicit_pass"
-        assert decisions[-1]["wake_source"] == "private"
+        assert "Autonomous Attention Protocol" in request.system_prompt
+        assert plugin.engine.store.state["decisions"] == []
         assert context.calls == []
     finally:
         await plugin.terminate()
 
 
 @pytest.mark.asyncio
-async def test_plugin_group_autonomous_gate_observes_on_invalid_model(
+async def test_plugin_group_passive_gate_allows_main_model_without_attention_call(
     tmp_path, monkeypatch
 ) -> None:
     from astrbot.api.message_components import Plain
@@ -468,15 +462,15 @@ async def test_plugin_group_autonomous_gate_observes_on_invalid_model(
     request = SimpleNamespace(system_prompt="", contexts=[], prompt="插件怎么配置")
     try:
         await plugin.passive_gate(event, request)
-        assert extras.get("_stopped") is True
-        decisions = plugin.engine.store.state["decisions"]
-        assert decisions[-1]["rejection_code"] in {"invalid_output", "model_error"}
-        assert len(context.calls) == 1
+        assert extras.get("_stopped") is None
+        assert plugin.engine.store.state["decisions"] == []
+        assert context.calls == []
     finally:
         await plugin.terminate()
 
 
 def _tool_event(is_admin: bool = False):
+    extras: dict[str, object] = {}
     return SimpleNamespace(
         unified_msg_origin="p:GroupMessage:g",
         get_group_id=lambda: "g",
@@ -484,6 +478,9 @@ def _tool_event(is_admin: bool = False):
         get_sender_id=lambda: "u1",
         get_sender_name=lambda: "用户",
         is_admin=lambda: is_admin,
+        set_extra=lambda key, value: extras.__setitem__(key, value),
+        stop_event=lambda: extras.__setitem__("_stopped", True),
+        get_extra=lambda key, default=None: extras.get(key, default),
     )
 
 
@@ -550,6 +547,28 @@ def test_config_schema_is_grouped_and_loads_nested_defaults(tmp_path) -> None:
     assert settings.passive_mode == "block_only"
     assert settings.max_agent_rounds == 4
     assert settings.group_allowlist == ()
+    assert settings.main_agent_attention_prompt_enabled is True
+    assert "attention_ignore_user" in settings.main_agent_attention_prompt
+
+
+def test_main_agent_attention_prompt_can_be_disabled_or_customized() -> None:
+    disabled = AutonomousAttentionPlugin.__new__(AutonomousAttentionPlugin)
+    disabled.settings = Settings.from_mapping(
+        {"general": {"main_agent_attention_prompt_enabled": False}}
+    )
+    request = SimpleNamespace(system_prompt="persona")
+    assert disabled._inject_attention_protocol(request) is False
+    assert request.system_prompt == "persona"
+
+    customized = AutonomousAttentionPlugin.__new__(AutonomousAttentionPlugin)
+    customized.settings = Settings.from_mapping(
+        {"general": {"main_agent_attention_prompt": "CUSTOM ATTENTION RULE"}}
+    )
+    request = SimpleNamespace(system_prompt="persona")
+    assert customized._inject_attention_protocol(request) is True
+    assert request.system_prompt == (
+        "persona\n\n[Autonomous Attention Protocol]\nCUSTOM ATTENTION RULE\n"
+    )
 
 
 @pytest.mark.asyncio
@@ -571,18 +590,40 @@ async def test_main_agent_tool_ignore_and_query(tmp_path, monkeypatch) -> None:
     )
     await plugin.initialize()
     try:
+        before_budget = dict(
+            plugin.engine.policy.ensure_budget(
+                plugin.engine.store.state,
+                plugin.engine.policy.now(),
+            )
+        )
+        tool_event = _tool_event()
         ignored = json.loads(
             await plugin.attention_ignore_user(
-                _tool_event(),
-                target_user="u2",
+                tool_event,
+                target_user="u1",
                 reason="test",
                 expires_in_minutes=30,
             )
         )
         assert ignored["ok"] is True
+        assert tool_event.get_extra("_stopped") is None
+        assert tool_event.get_extra("_aa_suppress_current_response") is None
+        assert (
+            plugin.engine.store.state["decisions"][-1]["code_decision"]
+            == "policy_saved"
+        )
+        after_budget = plugin.engine.policy.ensure_budget(
+            plugin.engine.store.state,
+            plugin.engine.policy.now(),
+        )
+        assert after_budget["decision_calls"] == before_budget["decision_calls"]
+        assert after_budget["main_calls"] == before_budget["main_calls"]
+        assert (
+            after_budget["autonomous_attempts"] == before_budget["autonomous_attempts"]
+        )
         blocked = await plugin.engine.check_hard_policy(
             group_id="g",
-            user_id="u2",
+            user_id="u1",
             umo="p:GroupMessage:g",
             platform_id="p",
             is_admin=False,

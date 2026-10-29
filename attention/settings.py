@@ -17,11 +17,14 @@ from typing import Any
 
 from astrbot.api import logger
 
-from .prompts import DEFAULT_ACTIVE_CRITERIA, DEFAULT_PASSIVE_CRITERIA
+from .prompts import (
+    DEFAULT_ACTIVE_CRITERIA,
+    DEFAULT_MAIN_AGENT_ATTENTION_PROMPT,
+    DEFAULT_PASSIVE_CRITERIA,
+)
 from .timeutil import resolve_timezone
 
 PASSIVE_MODES = frozenset({"off", "block_only", "full"})
-LOG_LEVELS = frozenset({"INFO", "DEBUG", "WARNING", "ERROR"})
 NO_PROGRESS_LIMIT = 3
 _WARNED_COMPATIBILITY: set[str] = set()
 
@@ -134,7 +137,6 @@ class Settings:
     max_reply_chars: int = 500
     max_reason_chars: int = 200
     dry_run: bool = False
-    log_level: str = "INFO"
     max_decision_log: int = 200
     passive_retry_delay_minutes: int = 10
     owner_override: bool = True
@@ -142,6 +144,8 @@ class Settings:
     main_agent_max_policy_hours: int = 24
     main_agent_max_intent_minutes: int = 30
     main_agent_tools_enabled: bool = True
+    main_agent_attention_prompt_enabled: bool = True
+    main_agent_attention_prompt: str = DEFAULT_MAIN_AGENT_ATTENTION_PROMPT
     timezone: str = ""
     tz: tzinfo = field(default_factory=lambda: resolve_timezone(""))
     seed_checkpoints: tuple[dict[str, Any], ...] = ()
@@ -185,9 +189,6 @@ class Settings:
         ).lower()
         if passive_mode not in PASSIVE_MODES:
             passive_mode = "block_only"
-        log_level = _text(_get(data, "general", "log_level"), "INFO").upper()
-        if log_level not in LOG_LEVELS:
-            log_level = "INFO"
         persona_source = _text(
             _get(data, "models", "persona_source"), "astrbot"
         ).lower()
@@ -384,7 +385,6 @@ class Settings:
                 _get(data, "agent_limits", "max_reason_chars"), 200, 20, 2000
             ),
             dry_run=_bool(_get(data, "general", "dry_run"), False),
-            log_level=log_level,
             max_decision_log=_int(
                 _get(data, "general", "max_decision_log"), 200, 10, 5000
             ),
@@ -417,6 +417,15 @@ class Settings:
                 _get(data, "general", "main_agent_tools_enabled"),
                 True,
             ),
+            main_agent_attention_prompt_enabled=_bool(
+                _get(data, "general", "main_agent_attention_prompt_enabled"),
+                True,
+            ),
+            main_agent_attention_prompt=_text(
+                _get(data, "general", "main_agent_attention_prompt"),
+                DEFAULT_MAIN_AGENT_ATTENTION_PROMPT,
+            )
+            or DEFAULT_MAIN_AGENT_ATTENTION_PROMPT,
             timezone=timezone_name,
             tz=resolve_timezone(timezone_name),
             seed_checkpoints=_dict_list(_get(data, "scheduling", "seed_checkpoints")),

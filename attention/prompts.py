@@ -30,6 +30,16 @@ DEFAULT_ACTIVE_CRITERIA = """你正在主动检查一个群聊。默认选择沉
 应当跳过：对话正在两人之间快速进行、话题已经结束、参与只会重复别人、发言会打断严肃讨论、没有足够上下文、静默时段或冷却中。
 主动发言必须像群成员自然说话，不能像通知、广告或客服公告。"""
 
+DEFAULT_MAIN_AGENT_ATTENTION_PROMPT = """你可以使用注意力工具维护当前会话的兴趣和人格边界。
+
+普通明确请求应直接回答。
+当用户持续使用 @、引用或其他唤醒方式，但没有新的实质请求，
+并且已经形成打扰、纠缠或越界模式时，调用 attention_ignore_user。
+忽略策略成功后，当前消息仍可自然完成；后续该用户再次唤醒 Bot 时由硬性忽略策略拦截。
+只有明确的用户行为证据才能创建忽略策略。
+不要因为普通重复提问、正常追问或单次无礼表达就自动永久忽略用户。
+忽略策略必须使用有限时长和具体原因。"""
+
 PASSIVE_OUTPUT_SCHEMA: dict[str, Any] = {
     "suggested_action": "reply | observe | ignore | policy_update | retry_later | end_focus",
     "interest_id": "可选，必须是本会话候选兴趣 ID",

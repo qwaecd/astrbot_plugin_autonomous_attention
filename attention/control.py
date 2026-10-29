@@ -1300,6 +1300,7 @@ class AttentionControlService:
         valid_ids: set[str] | None = None,
         bot_ids: set[str] | None = None,
         allow_direct: bool = False,
+        allow_interestless: bool = False,
     ) -> ControlResult:
         """Create one pending opportunity or return the existing anchor record."""
 
@@ -1377,7 +1378,7 @@ class AttentionControlService:
                     code="interest_not_found",
                     message="参与机会必须引用本会话中仍然有效的兴趣。",
                 )
-        elif kind != "direct_request":
+        elif kind != "direct_request" and not allow_interestless:
             return ControlResult(
                 ok=False,
                 code="interest_required",
@@ -1476,13 +1477,15 @@ class AttentionControlService:
         interest_id: str = "",
         interest_update: dict[str, Any] | None = None,
         consume_on_approval: bool = False,
+        allow_interestless: bool = False,
     ) -> ParticipationApproval:
         """Unified admission for passive and active autonomous participation.
 
         Direct-pass wake sources (private chat, wake prefix) pass without
         consuming an autonomous quota. Mentions, replies to the bot and
         autonomous paths must present a valid, unconsumed anchor and pass the
-        session/global quota checks in the same critical section.
+        session/global quota checks in the same critical section. Replies to a
+        direct mention may be approved without binding an interest.
         """
 
         direct_pass = wake_source in DIRECT_PASS_WAKE_SOURCES
@@ -1600,6 +1603,7 @@ class AttentionControlService:
             moment=moment,
             valid_ids=valid_ids,
             bot_ids=bot_ids,
+            allow_interestless=allow_interestless,
         )
         if not result.ok:
             return ParticipationApproval(

@@ -1,9 +1,9 @@
 name: astrbot_plugin_autonomous_attention
 display_name: 自主注意力
-desc: 基于兴趣决策模型的被动/主动注意力内核：判断是否放行主模型，并在检查点到达时主动观察群聊、决定参与或跳过。
+desc: 基于主动兴趣模型和主模型注意力工具的会话级注意力内核：维护兴趣与人格边界，并在检查点到达时主动观察群聊、决定参与或跳过。
 short_desc: 让 Bot 自己判断何时该关注、何时该沉默。
 author: qwaecd
-version: v1.2.0
+version: v1.2.1
 astrbot_version: ">=4.26,<5"
 repo: https://github.com/qwaecd/astrbot_plugin_autonomous_attention
 support_platforms:
